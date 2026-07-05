@@ -7,7 +7,7 @@
 
 SABLI is an ESModule-only TypeScript library for indexing and searching unordered schema-less JSON documents. SABLI stands for Segmented Adaptive Bloom-LSM Inverted Index.
 
-This initial package provides a correctness-first embedded database with a memory write buffer, append-only WAL, immutable disk segments, advisory Bloom pruning, adaptive posting abstractions, and exact final verification.
+Version 1.2 provides a correctness-first embedded database with a memory write buffer, append-only WAL, immutable disk segments, delete bitmaps, manual compaction, WAL checkpointing, advisory Bloom pruning, adaptive posting abstractions, and exact final verification.
 
 ## Installation
 
@@ -213,6 +213,18 @@ The v1.2 compaction policy is deliberately simple and deterministic: when `compa
 
 Compaction removes deleted documents and superseded old update versions from future compacted segments. It is manual in this milestone; no background or automatic compaction is started by the library.
 
+## Diagnostics
+
+Use `stats()` for lightweight read-only database diagnostics:
+
+```ts
+const stats = await db.stats();
+
+console.dir(stats, { depth: null });
+```
+
+The result includes the database path, open or closed state, manifest version, next document identifier, immutable segment count, active WAL generation, checkpoint sequence, approximate visible and deleted document counts, memory segment document count, and whether compaction can be called on the current handle.
+
 ## Query Examples
 
 Field-map syntax:
@@ -309,6 +321,21 @@ Partial trailing WAL records are handled deterministically by stopping at the la
 
 Checkpointing records the highest WAL sequence already represented by immutable segments. After flush or compaction, new writes go to the next WAL generation. Obsolete WAL generations are not required after a successful checkpoint.
 
+## Benchmarks
+
+SABLI includes deterministic TypeScript benchmark scripts for local measurement:
+
+```bash
+npm run bench:insert -- --count 1000
+npm run bench:search -- --count 1000
+npm run bench:reopen -- --count 1000
+npm run bench:compaction -- --count 1000
+```
+
+The scripts generate synthetic JSON documents, use temporary database directories by default, and print elapsed time in English. Pass `--keep` to keep the generated database directory for inspection.
+
+Benchmark results depend on hardware, filesystem behavior, Node.js version, durability mode, and active operating system caches. The current milestone prioritizes correctness-first storage behavior over benchmark-driven optimization.
+
 ## Current Limitations
 
 This release includes manual compaction and WAL generation checkpointing. Automatic background compaction, advanced compaction selection, optimized posting encodings, and advanced scope-aware array `elemMatch` semantics remain future work.
@@ -319,4 +346,4 @@ This release includes manual compaction and WAL generation checkpointing. Automa
 - More compact posting encodings.
 - Larger-scale lazy loading and cache controls.
 - Richer scoped array matching.
-- Additional storage diagnostics and recovery tooling.
+- Richer storage diagnostics and recovery tooling.

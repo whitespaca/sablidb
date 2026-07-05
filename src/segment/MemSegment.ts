@@ -54,6 +54,20 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
   }
 
   /**
+   * Number of physical document versions currently stored in memory.
+   */
+  public get physicalDocumentCount(): number {
+    return this.#documents.size;
+  }
+
+  /**
+   * Number of memory-resident document identifiers hidden by tombstones.
+   */
+  public get deletedDocumentCount(): number {
+    return this.#deleted.size;
+  }
+
+  /**
    * Last WAL sequence represented by this segment.
    */
   public get lastWalSequence(): number {

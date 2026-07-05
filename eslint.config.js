@@ -3,11 +3,11 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "node_modules/**", "coverage/**", "eslint.config.js"]
+    ignores: ["dist/**", "dist-bench/**", "node_modules/**", "coverage/**", "eslint.config.js"]
   },
   js.configs.recommended,
   {
-    files: ["src/**/*.ts", "test/**/*.ts", "*.ts"],
+    files: ["src/**/*.ts", "test/**/*.ts", "bench/**/*.ts", "*.ts"],
     extends: [...tseslint.configs.strictTypeChecked],
     languageOptions: {
       parserOptions: {
@@ -15,7 +15,7 @@ export default tseslint.config(
         tsconfigRootDir: import.meta.dirname
       }
     },
-    files: ["src/**/*.ts", "test/**/*.ts", "*.ts"],
+    files: ["src/**/*.ts", "test/**/*.ts", "bench/**/*.ts", "*.ts"],
     rules: {
       "@typescript-eslint/no-non-null-assertion": "error"
     }

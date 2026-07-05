@@ -2,6 +2,7 @@ export { BloomFilter } from "./bloom/bloom-filter.js";
 export type { SerializedBloomFilter } from "./bloom/bloom-filter.js";
 export { SabliDatabase } from "./database/SabliDatabase.js";
 export type { DatabaseLifecycleState } from "./database/DatabaseLifecycle.js";
+export type { SabliDatabaseStats } from "./database/DatabaseStats.js";
 export {
   SabliCorruptionError,
   SabliDatabaseClosedError,

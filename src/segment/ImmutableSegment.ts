@@ -68,6 +68,27 @@ export class ImmutableSegment {
   }
 
   /**
+   * Number of physical document versions written to this segment.
+   */
+  public get documentCount(): number {
+    return this.#metadata.docCount;
+  }
+
+  /**
+   * Number of document identifiers hidden by this segment delete bitmap.
+   */
+  public get deletedDocumentCount(): number {
+    return this.#deleted.size;
+  }
+
+  /**
+   * Approximate number of visible documents in this segment.
+   */
+  public get liveDocumentCount(): number {
+    return Math.max(0, this.#metadata.docCount - this.#deleted.size);
+  }
+
+  /**
    * Generates candidate documents for a query expression.
    *
    * @param expression - Normalized query expression.

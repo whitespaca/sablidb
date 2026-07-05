@@ -1,7 +1,9 @@
 node_modules/
 dist/
+dist-bench/
 coverage/
 .vitest/
 npm-debug.log*
 AGENT.md
 CODEX.md
+RELEASE.md

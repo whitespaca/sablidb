@@ -16,6 +16,7 @@ import { parseDatabaseOptions, type SabliDatabaseOptions } from "../validation/D
 import { parseQuery } from "../validation/queries.js";
 import type { DatabaseLifecycleState } from "./DatabaseLifecycle.js";
 import { isDatabaseOpen } from "./DatabaseLifecycle.js";
+import type { SabliDatabaseStats } from "./DatabaseStats.js";
 
 /**
  * Persistent embedded SABLI database.
@@ -257,6 +258,33 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
     }
     documents.sort((left, right) => Number(left.docId) - Number(right.docId));
     return { documents, count: documents.length };
+  }
+
+  /**
+   * Returns read-only diagnostic metadata for this database handle.
+   *
+   * @returns Safe database statistics that do not expose mutable internals.
+   * @remarks
+   * Counts are approximate because delete tombstones and superseded versions can
+   * remain physically present until manual compaction rewrites immutable segments.
+   */
+  public stats(): Promise<SabliDatabaseStats> {
+    const immutableLive = this.#segments.reduce((sum, segment) => sum + segment.liveDocumentCount, 0);
+    const immutableDeleted = this.#segments.reduce((sum, segment) => sum + segment.deletedDocumentCount, 0);
+    const memLive = this.#mem.documentCount;
+    return Promise.resolve({
+      path: this.#directory.paths.root,
+      state: isDatabaseOpen(this.#lifecycle) ? "open" : "closed",
+      manifestVersion: this.#manifest.version,
+      nextDocId: this.#manifest.nextDocId,
+      immutableSegmentCount: this.#manifest.segments.length,
+      activeWalGeneration: this.#manifest.activeWalGeneration,
+      checkpointSequence: this.#manifest.flushedWalSequence,
+      approximateLiveDocumentCount: immutableLive + memLive,
+      approximateDeletedDocumentCount: immutableDeleted + this.#mem.deletedDocumentCount,
+      memSegmentDocumentCount: memLive,
+      compactionAvailable: isDatabaseOpen(this.#lifecycle)
+    });
   }
 
   /**

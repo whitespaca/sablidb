@@ -17,17 +17,26 @@
   "files": [
     "dist",
     "examples",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "bench:build": "tsc -p tsconfig.bench.json",
+    "bench:check": "tsc -p tsconfig.bench.json --noEmit",
+    "bench:insert": "npm run bench:build && node dist-bench/bench/insert.js",
+    "bench:search": "npm run bench:build && node dist-bench/bench/search.js",
+    "bench:reopen": "npm run bench:build && node dist-bench/bench/reopen.js",
+    "bench:compaction": "npm run bench:build && node dist-bench/bench/compaction.js",
     "examples:check": "tsc -p tsconfig.examples.json --noEmit",
     "test": "npm run build && vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
-    "check": "npm run typecheck && npm run lint && npm run build && npm run examples:check && npm run test"
+    "pack:dry-run": "npm pack --dry-run",
+    "prepack": "npm run check",
+    "check": "npm run typecheck && npm run lint && npm run build && npm run examples:check && npm run bench:check && npm run test"
   },
   "keywords": [
     "json",

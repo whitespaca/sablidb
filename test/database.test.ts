@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import {
   SabliCorruptionError,
   SabliDatabase,
   SabliDatabaseClosedError,
+  SabliRecoveryError,
   SabliValidationError
 } from "../src/index.js";
 import { checksum, stableJson } from "../src/storage/Checksum.js";
@@ -30,8 +31,12 @@ function encodeWal(record: WalRecord): string {
 }
 
 async function activeWalPath(path: string): Promise<string> {
-  const manifest = parseDatabaseManifest(JSON.parse(await readFile(join(path, "MANIFEST-000001"), "utf8")));
+  const manifest = await activeManifest(path);
   return join(path, `WAL-${String(manifest.activeWalGeneration).padStart(6, "0")}.log`);
+}
+
+async function activeManifest(path: string) {
+  return parseDatabaseManifest(JSON.parse(await readFile(join(path, "MANIFEST-000001"), "utf8")));
 }
 
 async function segmentNames(path: string): Promise<readonly string[]> {
@@ -43,7 +48,20 @@ describe("SabliDatabase persistence", () => {
     const path = await tempDbPath();
     const db = await SabliDatabase.open({ path, createIfMissing: true });
     expect(db.path).toBe(path);
+    await expect(db.stats()).resolves.toMatchObject({
+      path,
+      state: "open",
+      manifestVersion: 1,
+      immutableSegmentCount: 0,
+      activeWalGeneration: 1,
+      checkpointSequence: 0,
+      approximateLiveDocumentCount: 0,
+      approximateDeletedDocumentCount: 0,
+      memSegmentDocumentCount: 0,
+      compactionAvailable: true
+    });
     await db.close();
+    await expect(db.stats()).resolves.toMatchObject({ state: "closed", compactionAvailable: false });
   });
 
   it("reopens an existing database", async () => {
@@ -121,6 +139,22 @@ describe("SabliDatabase persistence", () => {
     const matches = await db.search({ where: { "user.name": { eq: "flushed" } } });
     expect(matches.count).toBe(1);
     await expect(readFile(join(path, "segments", "seg-000001", "segment.meta.json"), "utf8")).resolves.toContain("sabli-segment");
+    await db.close();
+  });
+
+  it("reports stats for memory and disk state", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const first = await db.insert({ user: { name: "stats-disk" } });
+    await db.flush();
+    const second = await db.insert({ user: { name: "stats-memory" } });
+    await db.delete(first.docId);
+    const stats = await db.stats();
+    expect(stats.nextDocId).toBe(Number(second.docId) + 1);
+    expect(stats.immutableSegmentCount).toBe(1);
+    expect(stats.memSegmentDocumentCount).toBe(1);
+    expect(stats.approximateLiveDocumentCount).toBe(1);
+    expect(stats.approximateDeletedDocumentCount).toBe(1);
     await db.close();
   });
 
@@ -274,6 +308,42 @@ describe("SabliDatabase persistence", () => {
     await db.close();
   });
 
+  it("compacts an empty database without creating live segments", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.compact();
+    expect(await segmentNames(path)).toHaveLength(0);
+    const stats = await db.stats();
+    expect(stats.immutableSegmentCount).toBe(0);
+    expect(stats.approximateLiveDocumentCount).toBe(0);
+    await db.close();
+  });
+
+  it("compacts a database with only a memory segment", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "memory-only" } });
+    await db.compact();
+    expect(await segmentNames(path)).toHaveLength(1);
+    expect((await db.search({ where: { "user.name": { eq: "memory-only" } } })).count).toBe(1);
+    expect((await db.stats()).memSegmentDocumentCount).toBe(0);
+    await db.close();
+  });
+
+  it("repeated compaction calls preserve visible state", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true, memSegmentMaxDocuments: 1 });
+    await db.insert({ user: { name: "repeat" }, tags: ["stable"] });
+    await db.insert({ user: { name: "repeat-two" }, tags: ["stable"] });
+    const before = await db.search({ where: { "tags[]": { contains: "stable" } } });
+    await db.compact();
+    await db.compact();
+    const after = await db.search({ where: { "tags[]": { contains: "stable" } } });
+    expect(after.documents).toEqual(before.documents);
+    expect(await segmentNames(path)).toHaveLength(1);
+    await db.close();
+  });
+
   it("compaction removes deleted documents from the compacted segment", async () => {
     const path = await tempDbPath();
     const db = await SabliDatabase.open({ path, createIfMissing: true });
@@ -316,18 +386,127 @@ describe("SabliDatabase persistence", () => {
     await db.close();
   });
 
+  it("does not resurrect update-then-delete documents after reopen", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const old = await db.insert({ user: { name: "reopen-gone-old" } });
+    await db.flush();
+    const replacement = await db.update(old.docId, { user: { name: "reopen-gone-new" } });
+    await db.delete(replacement.docId);
+    await db.compact();
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "reopen-gone-old" } } })).count).toBe(0);
+    expect((await reopened.search({ where: { "user.name": { eq: "reopen-gone-new" } } })).count).toBe(0);
+    await reopened.close();
+  });
+
   it("checkpoint advances and rotates WAL after compaction", async () => {
     const path = await tempDbPath();
     const db = await SabliDatabase.open({ path, createIfMissing: true });
     await db.insert({ user: { name: "checkpoint" } });
     await db.flush();
-    const before = parseDatabaseManifest(JSON.parse(await readFile(join(path, "MANIFEST-000001"), "utf8")));
+    const before = await activeManifest(path);
     await db.compact();
-    const after = parseDatabaseManifest(JSON.parse(await readFile(join(path, "MANIFEST-000001"), "utf8")));
+    const after = await activeManifest(path);
     expect(after.flushedWalSequence).toBeGreaterThanOrEqual(before.flushedWalSequence);
     expect(after.activeWalGeneration).toBeGreaterThan(before.activeWalGeneration);
     await db.insert({ user: { name: "after-checkpoint" } });
     await expect(readFile(await activeWalPath(path), "utf8")).resolves.toContain("after-checkpoint");
     await db.close();
+  });
+
+  it("checkpoint advances after flush and replay does not duplicate flushed records", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "no-duplicate" } });
+    await db.flush();
+    const manifest = await activeManifest(path);
+    expect(manifest.flushedWalSequence).toBeGreaterThan(0);
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    const matches = await reopened.search({ where: { "user.name": { eq: "no-duplicate" } } });
+    expect(matches.documents.map((hit) => hit.docId)).toEqual([toDocId(1)]);
+    await reopened.close();
+  });
+
+  it("uses multiple WAL generations across reopen", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "generation-one" } });
+    await db.flush();
+    const afterFlush = await activeManifest(path);
+    expect(afterFlush.activeWalGeneration).toBe(2);
+    await db.insert({ user: { name: "generation-two" } });
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "generation-one" } } })).count).toBe(1);
+    expect((await reopened.search({ where: { "user.name": { eq: "generation-two" } } })).count).toBe(1);
+    expect((await reopened.stats()).activeWalGeneration).toBeGreaterThanOrEqual(2);
+    await reopened.close();
+  });
+
+  it("does not require obsolete WAL generations after checkpoint", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "checkpoint-only" } });
+    await db.flush();
+    await expect(readFile(join(path, "WAL-000001.log"), "utf8")).rejects.toThrow();
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "checkpoint-only" } } })).count).toBe(1);
+    await reopened.close();
+  });
+
+  it("rejects WAL checksum mismatch with a controlled recovery error", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.close();
+    await writeFile(
+      await activeWalPath(path),
+      `${JSON.stringify({
+        record: {
+          format: "sabli-wal-record",
+          version: 1,
+          sequence: 1,
+          type: "insert",
+          docId: 1,
+          document: { user: { name: "bad-checksum" } }
+        },
+        checksum: "not-the-checksum"
+      })}\n`
+    );
+    await expect(SabliDatabase.open({ path, createIfMissing: false })).rejects.toThrow(SabliRecoveryError);
+  });
+
+  it("keeps CURRENT pointing at the active manifest", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "current" } });
+    await db.compact();
+    expect((await readFile(join(path, "CURRENT"), "utf8")).trim()).toBe("MANIFEST-000001");
+    const manifest = await activeManifest(path);
+    expect(manifest.segments).toHaveLength(1);
+    expect(manifest.segments[0]?.path).toMatch(/^segments\/seg-\d{6}$/);
+    expect(await segmentNames(path)).toEqual([manifest.segments[0]?.path.split("/").at(-1)]);
+    await db.close();
+  });
+
+  it("cleans safe temporary segment directories on startup", async () => {
+    const path = await tempDbPath();
+    await (await SabliDatabase.open({ path, createIfMissing: true })).close();
+    await mkdir(join(path, "segments", "seg-leftover.tmp"), { recursive: true });
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect(await readdir(join(path, "segments"))).not.toContain("seg-leftover.tmp");
+    await reopened.close();
+  });
+
+  it("does not delete unknown segment directories on startup", async () => {
+    const path = await tempDbPath();
+    await (await SabliDatabase.open({ path, createIfMissing: true })).close();
+    await mkdir(join(path, "segments", "unknown-data"), { recursive: true });
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect(await readdir(join(path, "segments"))).toContain("unknown-data");
+    await reopened.close();
   });
 });

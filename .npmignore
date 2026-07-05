@@ -11,6 +11,8 @@ sabli_paper.pdf
 src/
 test/
 dist/**/*.map
+dist-bench/
+bench/
 
 eslint.config.js
 tsconfig.json
