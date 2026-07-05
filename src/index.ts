@@ -1,9 +1,14 @@
 export { BloomFilter } from "./bloom/bloom-filter.js";
 export type { SerializedBloomFilter } from "./bloom/bloom-filter.js";
+export { SabliDatabase } from "./database/SabliDatabase.js";
+export type { DatabaseLifecycleState } from "./database/DatabaseLifecycle.js";
 export {
   SabliCorruptionError,
+  SabliDatabaseClosedError,
   SabliError,
+  SabliLockError,
   SabliQueryError,
+  SabliRecoveryError,
   SabliStorageError,
   SabliValidationError
 } from "./errors/index.js";
@@ -31,7 +36,11 @@ export type {
 export { planQuery } from "./query/planner.js";
 export type { QueryPlan } from "./query/planner.js";
 export { verifyDocument } from "./query/verifier.js";
+export { MemSegment } from "./segment/MemSegment.js";
+export { ImmutableSegment } from "./segment/ImmutableSegment.js";
 export type { SegmentManifest } from "./segment/metadata.js";
+export type { SegmentMetadata } from "./segment/SegmentMetadata.js";
+export type { SabliDatabaseOptions } from "./validation/DatabaseOptionsValidation.js";
 export type {
   DocId,
   JsonArray,
@@ -47,5 +56,7 @@ export { toDocId, toSegmentId } from "./types/json.js";
 export { parseJsonDocument } from "./validation/documents.js";
 export { formatValidationError } from "./validation/errors.js";
 export { parseSegmentManifest } from "./validation/manifests.js";
+export { parseDatabaseOptions } from "./validation/DatabaseOptionsValidation.js";
+export { parseDatabaseManifest } from "./validation/ManifestValidation.js";
 export { parseSabliOptions } from "./validation/options.js";
 export { parseQuery } from "./validation/queries.js";

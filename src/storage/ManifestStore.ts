@@ -1,0 +1,184 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { SegmentId } from "../types/json.js";
+import { toDocId, toSegmentId, type DocId } from "../types/json.js";
+import { writeFileAtomic } from "./AtomicFile.js";
+import { checksum, stableJson } from "./Checksum.js";
+import { SabliCorruptionError } from "../errors/index.js";
+import { t } from "typesea";
+
+const ManifestInputGuard = t.record(t.unknown);
+
+/**
+ * Segment entry recorded in the database manifest.
+ */
+export interface ManifestSegmentEntry {
+  /** Segment identifier. */
+  readonly segmentId: SegmentId;
+  /** Segment directory relative path. */
+  readonly path: string;
+  /** Number of documents in the segment. */
+  readonly docCount: number;
+}
+
+/**
+ * Versioned database manifest persisted under MANIFEST files.
+ */
+export interface DatabaseManifest {
+  /** Manifest format marker. */
+  readonly format: "sabli-manifest";
+  /** Manifest format version. */
+  readonly version: 1;
+  /** Next document identifier to assign. */
+  readonly nextDocId: DocId;
+  /** Next immutable segment identifier to assign. */
+  readonly nextSegmentId: SegmentId;
+  /** Live immutable segment list. */
+  readonly segments: readonly ManifestSegmentEntry[];
+  /** Last WAL sequence included in durable immutable segments. */
+  readonly flushedWalSequence: number;
+  /** Checksum over the manifest payload. */
+  readonly checksum: string;
+}
+
+/**
+ * Persists and loads database manifests through CURRENT.
+ */
+export class ManifestStore {
+  readonly #root: string;
+  readonly #currentPath: string;
+
+  /**
+   * Creates a manifest store.
+   *
+   * @param root - Database root directory.
+   * @param currentPath - CURRENT file path.
+   */
+  public constructor(root: string, currentPath: string) {
+    this.#root = root;
+    this.#currentPath = currentPath;
+  }
+
+  /**
+   * Creates an empty manifest.
+   *
+   * @returns Initial manifest.
+   */
+  public createInitial(): DatabaseManifest {
+    return this.withChecksum({
+      format: "sabli-manifest",
+      version: 1,
+      nextDocId: toDocId(1),
+      nextSegmentId: toSegmentId(1),
+      segments: [],
+      flushedWalSequence: 0
+    });
+  }
+
+  /**
+   * Reads the active manifest.
+   *
+   * @returns Validated manifest.
+   * @throws {SabliCorruptionError} If CURRENT or the manifest is malformed.
+   */
+  public async read(): Promise<DatabaseManifest> {
+    const current = (await readFile(this.#currentPath, "utf8")).trim();
+    if (current.length === 0) {
+      throw new SabliCorruptionError("Invalid CURRENT file: expected a manifest file name.");
+    }
+    const raw = await readFile(join(this.#root, current), "utf8");
+    return parseDatabaseManifest(JSON.parse(raw));
+  }
+
+  /**
+   * Writes a manifest and updates CURRENT atomically enough for the JSON metadata format.
+   *
+   * @param manifest - Manifest to persist.
+   */
+  public async write(manifest: DatabaseManifest): Promise<void> {
+    const name = "MANIFEST-000001";
+    await writeFileAtomic(join(this.#root, name), `${JSON.stringify(this.withChecksum(manifest), null, 2)}\n`);
+    await writeFileAtomic(this.#currentPath, `${name}\n`);
+  }
+
+  private withChecksum(input: Omit<DatabaseManifest, "checksum"> | DatabaseManifest): DatabaseManifest {
+    const payload = {
+      format: input.format,
+      version: input.version,
+      nextDocId: input.nextDocId,
+      nextSegmentId: input.nextSegmentId,
+      segments: input.segments,
+      flushedWalSequence: input.flushedWalSequence
+    };
+    return { ...payload, checksum: checksum(stableJson(payload)) };
+  }
+}
+
+/**
+ * Validates and narrows unknown persisted database manifest data.
+ *
+ * @param input - Unknown manifest payload.
+ * @returns Validated database manifest.
+ * @throws {SabliCorruptionError} If the manifest is malformed.
+ */
+export function parseDatabaseManifest(input: unknown): DatabaseManifest {
+  const result = ManifestInputGuard.check(input);
+  if (!result.ok || typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new SabliCorruptionError("Invalid manifest: expected an object.");
+  }
+  const record = input as Readonly<Record<string, unknown>>;
+  if (record.format !== "sabli-manifest" || record.version !== 1) {
+    throw new SabliCorruptionError("Invalid manifest: unsupported format or version.");
+  }
+  if (typeof record.nextDocId !== "number" || !Number.isInteger(record.nextDocId) || record.nextDocId < 1) {
+    throw new SabliCorruptionError("Invalid manifest: nextDocId must be a positive integer.");
+  }
+  if (typeof record.nextSegmentId !== "number" || !Number.isInteger(record.nextSegmentId) || record.nextSegmentId < 1) {
+    throw new SabliCorruptionError("Invalid manifest: nextSegmentId must be a positive integer.");
+  }
+  if (typeof record.flushedWalSequence !== "number" || !Number.isInteger(record.flushedWalSequence) || record.flushedWalSequence < 0) {
+    throw new SabliCorruptionError("Invalid manifest: flushedWalSequence must be a non-negative integer.");
+  }
+  if (!Array.isArray(record.segments)) {
+    throw new SabliCorruptionError("Invalid manifest: segments must be an array.");
+  }
+  const segments = record.segments.map((segment): ManifestSegmentEntry => {
+    if (typeof segment !== "object" || segment === null || Array.isArray(segment)) {
+      throw new SabliCorruptionError("Invalid manifest: segment entries must be objects.");
+    }
+    const entry = segment as Readonly<Record<string, unknown>>;
+    if (typeof entry.segmentId !== "number" || !Number.isInteger(entry.segmentId) || entry.segmentId < 1) {
+      throw new SabliCorruptionError("Invalid manifest: segmentId must be a positive integer.");
+    }
+    if (typeof entry.path !== "string" || entry.path.length === 0) {
+      throw new SabliCorruptionError("Invalid manifest: segment path must be a non-empty string.");
+    }
+    if (typeof entry.docCount !== "number" || !Number.isInteger(entry.docCount) || entry.docCount < 0) {
+      throw new SabliCorruptionError("Invalid manifest: segment docCount must be a non-negative integer.");
+    }
+    return { segmentId: toSegmentId(entry.segmentId), path: entry.path, docCount: entry.docCount };
+  });
+  if (typeof record.checksum !== "string") {
+    throw new SabliCorruptionError("Invalid manifest: checksum must be a string.");
+  }
+  const payload = {
+    format: record.format,
+    version: record.version,
+    nextDocId: record.nextDocId,
+    nextSegmentId: record.nextSegmentId,
+    segments: record.segments,
+    flushedWalSequence: record.flushedWalSequence
+  };
+  if (checksum(stableJson(payload)) !== record.checksum) {
+    throw new SabliCorruptionError("Invalid manifest: checksum mismatch.");
+  }
+  return {
+    format: "sabli-manifest",
+    version: 1,
+    nextDocId: toDocId(record.nextDocId),
+    nextSegmentId: toSegmentId(record.nextSegmentId),
+    flushedWalSequence: record.flushedWalSequence,
+    segments,
+    checksum: record.checksum
+  };
+}

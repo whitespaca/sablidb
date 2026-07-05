@@ -7,7 +7,7 @@
 
 SABLI is an ESModule-only TypeScript library for indexing and searching unordered schema-less JSON documents. SABLI stands for Segmented Adaptive Bloom-LSM Inverted Index.
 
-This initial package provides a correctness-first in-memory mutable segment with path-value extraction, advisory Bloom pruning, adaptive posting abstractions, and exact final verification.
+This initial package provides a correctness-first embedded database with a memory write buffer, append-only WAL, immutable disk segments, advisory Bloom pruning, adaptive posting abstractions, and exact final verification.
 
 ## Installation
 
@@ -20,16 +20,19 @@ SABLI targets Node.js 22 or later and is published as ESModule only.
 ## Basic Usage
 
 ```ts
-import { SabliEngine } from "@whitespaca/sabli";
+import { SabliDatabase } from "@whitespaca/sabli";
 
-const engine = new SabliEngine();
+const db = await SabliDatabase.open({
+  path: "./data/users.sabli",
+  createIfMissing: true
+});
 
-await engine.insert({
+await db.insert({
   user: { name: "Kim", age: 31 },
   tags: ["backend", "typescript"]
 });
 
-const results = await engine.search({
+const results = await db.search({
   where: {
     and: [
       { path: "user.name", eq: "Kim" },
@@ -39,6 +42,8 @@ const results = await engine.search({
 });
 
 console.log(results.documents);
+
+await db.close();
 ```
 
 ## Query Examples
@@ -46,7 +51,7 @@ console.log(results.documents);
 Field-map syntax:
 
 ```ts
-await engine.search({
+await db.search({
   where: {
     "user.name": { eq: "Kim" },
     "tags[]": { contains: "typescript" }
@@ -57,7 +62,7 @@ await engine.search({
 Explicit Boolean syntax:
 
 ```ts
-await engine.search({
+await db.search({
   where: {
     and: [
       { path: "user.age", gte: 30 },
@@ -79,6 +84,30 @@ Documents must be JSON-compatible plain objects. Values such as `undefined`, `Da
 
 Indexes and Bloom filters only generate candidate documents. SABLI verifies every candidate against the raw JSON document before returning it, so final search results follow exact query semantics.
 
+## Disk Layout
+
+A SABLI database is a directory with a lock file, `CURRENT`, a versioned manifest, one append-only WAL file, and immutable segment directories:
+
+```txt
+database.sabli/
+  LOCK
+  CURRENT
+  MANIFEST-000001
+  WAL-000001.log
+  segments/
+    seg-000001/
+      segment.meta.json
+      docs.bin
+      docs.offset
+      path.dict
+      value.dict
+      postings.idx
+      bloom.bin
+      delete.bitmap
+```
+
+Inserts are appended to the WAL before they are acknowledged in strict durability mode. `flush()` writes the current memory segment to an immutable disk segment and updates the manifest atomically.
+
 ## Current Limitations
 
-This release is an in-memory correctness foundation. Persistent segments, WAL recovery, compaction, optimized posting encodings, and advanced scope-aware array `elemMatch` semantics are planned future work.
+This release is a persistent correctness foundation. Compaction, optimized posting encodings, delete bitmaps, full update/delete APIs, and advanced scope-aware array `elemMatch` semantics are planned future work.
