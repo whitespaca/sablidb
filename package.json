@@ -1,5 +1,5 @@
 {
-  "name": "@sabli/core",
+  "name": "sabli",
   "version": "0.1.0",
   "description": "Segmented Adaptive Bloom-LSM Inverted Index for JSON documents.",
   "type": "module",
