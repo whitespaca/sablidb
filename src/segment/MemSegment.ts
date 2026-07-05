@@ -50,7 +50,7 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
    * Number of live documents in memory.
    */
   public get documentCount(): number {
-    return this.#documents.size;
+    return [...this.#documents.keys()].filter((docId) => !this.#deleted.has(docId)).length;
   }
 
   /**
@@ -70,6 +70,7 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
    */
   public insertWithDocId(docId: DocId, document: TDocument, walSequence: number): number {
     this.#documents.set(docId, document);
+    this.#deleted.delete(docId);
     this.#lastWalSequence = Math.max(this.#lastWalSequence, walSequence);
     const entries = extractEntries(document);
     for (const entry of entries) {
@@ -101,13 +102,36 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
   }
 
   /**
+   * Marks a memory-resident document as deleted.
+   *
+   * @param docId - Document identifier to hide from future searches.
+   * @param walSequence - WAL sequence for recovery ordering.
+   */
+  public delete(docId: DocId, walSequence: number): void {
+    this.#deleted.add(docId);
+    this.#lastWalSequence = Math.max(this.#lastWalSequence, walSequence);
+  }
+
+  /**
+   * Tests whether the memory segment contains a physical document identifier.
+   *
+   * @param docId - Document identifier to test.
+   * @returns True when the identifier is stored in memory.
+   */
+  public hasDocument(docId: DocId): boolean {
+    return this.#documents.has(docId);
+  }
+
+  /**
    * Returns a snapshot suitable for segment flush.
    *
    * @returns Immutable view of memory segment contents.
    */
   public snapshot(): MemSegmentSnapshot<TDocument> {
     return {
-      documents: [...this.#documents.entries()].map(([docId, document]) => ({ docId, document })),
+      documents: [...this.#documents.entries()]
+        .filter(([docId]) => !this.#deleted.has(docId))
+        .map(([docId, document]) => ({ docId, document })),
       lastWalSequence: this.#lastWalSequence
     };
   }

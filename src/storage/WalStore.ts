@@ -4,6 +4,7 @@ import type { JsonObject } from "../types/json.js";
 import { toDocId, type DocId } from "../types/json.js";
 import { checksum, stableJson } from "./Checksum.js";
 import { t } from "typesea";
+import { JsonObjectGuard } from "../validation/schemas.js";
 
 const WalRecordInputGuard = t.record(t.unknown);
 
@@ -204,7 +205,8 @@ export function parseWalRecord(input: unknown): WalRecord {
     return { format: "sabli-wal-record", version: 1, sequence: record.sequence, type: "delete", docId: toDocId(record.docId) };
   }
   if (record.type === "insert" || record.type === "update") {
-    if (typeof record.document !== "object" || record.document === null || Array.isArray(record.document)) {
+    const documentResult = JsonObjectGuard.check(record.document);
+    if (!documentResult.ok) {
       throw new SabliRecoveryError("Invalid WAL record: document must be an object.");
     }
     return {
@@ -213,7 +215,7 @@ export function parseWalRecord(input: unknown): WalRecord {
       sequence: record.sequence,
       type: record.type,
       docId: toDocId(record.docId),
-      document: record.document as JsonObject
+      document: documentResult.value
     };
   }
   throw new SabliRecoveryError("Invalid WAL record: unsupported operation type.");

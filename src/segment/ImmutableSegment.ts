@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BloomFilter } from "../bloom/bloom-filter.js";
 import { DocumentBlockReader } from "../storage/DocumentBlockStore.js";
+import { writeFileAtomic } from "../storage/AtomicFile.js";
 import type { OffsetTableFile } from "../storage/OffsetTable.js";
 import type { DocId, JsonObject } from "../types/json.js";
 import { toDocId } from "../types/json.js";
@@ -19,6 +20,16 @@ interface PostingIndexFile {
   readonly numericValues: readonly (readonly [string, readonly { readonly docId: number; readonly value: number }[]])[];
 }
 
+interface DeleteBitmapFile {
+  readonly format: "sabli-delete-bitmap";
+  readonly version: 1;
+  readonly deleted: readonly number[];
+}
+
+function isNumberArray(value: unknown): value is readonly number[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "number");
+}
+
 /**
  * Immutable disk-backed segment reader.
  */
@@ -26,6 +37,7 @@ export class ImmutableSegment {
   readonly #root: string;
   readonly #metadata: SegmentMetadata;
   readonly #bloom: BloomFilter;
+  readonly #deleted = new Set<number>();
   #postings: PostingIndexFile | undefined;
   #documents: DocumentBlockReader | undefined;
 
@@ -43,7 +55,9 @@ export class ImmutableSegment {
    */
   public static async open(root: string): Promise<ImmutableSegment> {
     const metadata = parseSegmentMetadata(JSON.parse(await readFile(join(root, "segment.meta.json"), "utf8")));
-    return new ImmutableSegment(root, metadata);
+    const segment = new ImmutableSegment(root, metadata);
+    await segment.loadDeleteBitmap();
+    return segment;
   }
 
   /**
@@ -70,8 +84,28 @@ export class ImmutableSegment {
    * @returns Raw document or undefined.
    */
   public async getDocument(docId: DocId): Promise<JsonObject | undefined> {
+    if (this.isDeleted(docId)) {
+      return undefined;
+    }
     const reader = await this.documentReader();
     return reader.read(docId);
+  }
+
+  /**
+   * Marks a document identifier deleted in this immutable segment.
+   *
+   * @param docId - Document identifier to tombstone.
+   */
+  public async markDeleted(docId: DocId): Promise<void> {
+    if (Number(docId) < this.#metadata.minDocId || Number(docId) > this.#metadata.maxDocId) {
+      return;
+    }
+    const document = await this.getDocumentIgnoringDelete(docId);
+    if (document === undefined) {
+      return;
+    }
+    this.#deleted.add(Number(docId));
+    await this.writeDeleteBitmap();
   }
 
   /**
@@ -92,6 +126,44 @@ export class ImmutableSegment {
     return this.#documents;
   }
 
+  private async getDocumentIgnoringDelete(docId: DocId): Promise<JsonObject | undefined> {
+    const reader = await this.documentReader();
+    return reader.read(docId);
+  }
+
+  private isDeleted(docId: DocId): boolean {
+    return this.#deleted.has(Number(docId));
+  }
+
+  private async loadDeleteBitmap(): Promise<void> {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(join(this.#root, "delete.bitmap"), "utf8"));
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        return;
+      }
+      const record = parsed as Readonly<Record<string, unknown>>;
+      if (record.format !== "sabli-delete-bitmap" || record.version !== 1 || !isNumberArray(record.deleted)) {
+        return;
+      }
+      for (const docId of record.deleted) {
+        if (Number.isInteger(docId) && docId >= 1) {
+          this.#deleted.add(docId);
+        }
+      }
+    } catch {
+      return;
+    }
+  }
+
+  private async writeDeleteBitmap(): Promise<void> {
+    const payload: DeleteBitmapFile = {
+      format: "sabli-delete-bitmap",
+      version: 1,
+      deleted: [...this.#deleted].sort((left, right) => left - right)
+    };
+    await writeFileAtomic(join(this.#root, "delete.bitmap"), `${JSON.stringify(payload)}\n`);
+  }
+
   private async postings(): Promise<PostingIndexFile> {
     this.#postings ??= JSON.parse(await readFile(join(this.#root, "postings.idx"), "utf8")) as PostingIndexFile;
     return this.#postings;
@@ -100,13 +172,15 @@ export class ImmutableSegment {
   private allDocuments(): PostingList {
     const ids: DocId[] = [];
     for (let value = this.#metadata.minDocId; value <= this.#metadata.maxDocId; value += 1) {
-      ids.push(toDocId(value));
+      if (!this.#deleted.has(value)) {
+        ids.push(toDocId(value));
+      }
     }
     return new SortedArrayPostingList(ids);
   }
 
   private postingFromNumbers(values: readonly number[] | undefined): PostingList {
-    return new SortedArrayPostingList((values ?? []).map((value) => toDocId(value)));
+    return new SortedArrayPostingList((values ?? []).filter((value) => !this.#deleted.has(value)).map((value) => toDocId(value)));
   }
 
   private async candidatesForPredicate(predicate: QueryPredicate): Promise<PostingList> {

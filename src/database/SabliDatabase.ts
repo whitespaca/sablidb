@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { SabliDatabaseClosedError, SabliStorageError } from "../errors/index.js";
+import { SabliDatabaseClosedError, SabliStorageError, SabliValidationError } from "../errors/index.js";
 import type { InsertResult, Query, SearchResult } from "../query/ast.js";
 import { verifyDocument } from "../query/verifier.js";
 import { MemSegment } from "../segment/MemSegment.js";
@@ -100,7 +100,10 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
         if (record.type === "insert" || record.type === "update") {
           mem.insertWithDocId(record.docId, record.document as TDocument, record.sequence);
           nextDocId = Math.max(nextDocId, Number(record.docId) + 1);
+          continue;
         }
+        mem.delete(record.docId, record.sequence);
+        await Promise.all(segments.map((segment) => segment.markDeleted(record.docId)));
       }
       const opened = new SabliDatabase<TDocument>({
         options: parsed,
@@ -153,6 +156,76 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       await this.flush();
     }
     return { docId, entryCount };
+  }
+
+  /**
+   * Deletes a visible document from future search results.
+   *
+   * @param docId - Document identifier to delete.
+   * @throws {SabliDatabaseClosedError} If the database has been closed.
+   * @throws {SabliValidationError} If the identifier is invalid.
+   */
+  public async delete(docId: unknown): Promise<void> {
+    this.assertOpen();
+    const parsedDocId = parseDocIdInput(docId, "delete");
+    const sequence = this.#nextWalSequence;
+    const record: WalRecord = {
+      format: "sabli-wal-record",
+      version: 1,
+      sequence,
+      type: "delete",
+      docId: parsedDocId
+    };
+    await this.#wal.append(record, this.#options.durability === "strict");
+    await this.applyDelete(parsedDocId, sequence);
+    this.#nextWalSequence += 1;
+  }
+
+  /**
+   * Replaces a visible document with a new document version.
+   *
+   * @param docId - Existing document identifier to supersede.
+   * @param document - New JSON document version.
+   * @returns Insertion metadata for the new document version.
+   * @throws {SabliDatabaseClosedError} If the database has been closed.
+   * @throws {SabliValidationError} If the identifier or document is invalid.
+   * @throws {SabliStorageError} If the old document is not visible.
+   */
+  public async update(docId: unknown, document: unknown): Promise<InsertResult> {
+    this.assertOpen();
+    const oldDocId = parseDocIdInput(docId, "update");
+    if (!(await this.isVisible(oldDocId))) {
+      throw new SabliStorageError("Cannot update document: docId is not visible.");
+    }
+    const parsed = parseJsonDocument(document) as TDocument;
+    const deleteSequence = this.#nextWalSequence;
+    const newDocId = this.#manifest.nextDocId;
+    const insertSequence = deleteSequence + 1;
+    const deleteRecord: WalRecord = {
+      format: "sabli-wal-record",
+      version: 1,
+      sequence: deleteSequence,
+      type: "delete",
+      docId: oldDocId
+    };
+    const insertRecord: WalRecord = {
+      format: "sabli-wal-record",
+      version: 1,
+      sequence: insertSequence,
+      type: "insert",
+      docId: newDocId,
+      document: parsed
+    };
+    await this.#wal.append(deleteRecord, this.#options.durability === "strict");
+    await this.#wal.append(insertRecord, this.#options.durability === "strict");
+    await this.applyDelete(oldDocId, deleteSequence);
+    const entryCount = this.#mem.insertWithDocId(newDocId, parsed, insertSequence);
+    this.#nextWalSequence += 2;
+    this.#manifest = { ...this.#manifest, nextDocId: toDocId(Number(newDocId) + 1) };
+    if (this.#mem.documentCount >= this.#options.memSegmentMaxDocuments) {
+      await this.flush();
+    }
+    return { docId: newDocId, entryCount };
   }
 
   /**
@@ -241,4 +314,30 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       throw new SabliDatabaseClosedError("SABLI database is closed.");
     }
   }
+
+  private async applyDelete(docId: DocId, sequence: number): Promise<void> {
+    if (this.#mem.hasDocument(docId)) {
+      this.#mem.delete(docId, sequence);
+    }
+    await Promise.all(this.#segments.map((segment) => segment.markDeleted(docId)));
+  }
+
+  private async isVisible(docId: DocId): Promise<boolean> {
+    if (this.#mem.getDocument(docId) !== undefined) {
+      return true;
+    }
+    for (const segment of this.#segments) {
+      if ((await segment.getDocument(docId)) !== undefined) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
+function parseDocIdInput(input: unknown, operation: string): DocId {
+  if (typeof input !== "number" || !Number.isInteger(input) || input < 1) {
+    throw new SabliValidationError(`Invalid ${operation} docId: expected a positive integer.`);
+  }
+  return toDocId(input);
 }

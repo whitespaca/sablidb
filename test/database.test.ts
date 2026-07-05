@@ -125,6 +125,113 @@ describe("SabliDatabase persistence", () => {
     await db.close();
   });
 
+  it("does not return deleted memory documents", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const inserted = await db.insert({ user: { name: "temporary" } });
+    await db.delete(inserted.docId);
+    const matches = await db.search({ where: { "user.name": { eq: "temporary" } } });
+    expect(matches.count).toBe(0);
+    await db.close();
+  });
+
+  it("does not return deleted disk segment documents", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const inserted = await db.insert({ user: { name: "disk-delete" } });
+    await db.flush();
+    await db.delete(inserted.docId);
+    const matches = await db.search({ where: { "user.name": { eq: "disk-delete" } } });
+    expect(matches.count).toBe(0);
+    await expect(readFile(join(path, "segments", "seg-000001", "delete.bitmap"), "utf8")).resolves.toContain(String(inserted.docId));
+    await db.close();
+  });
+
+  it("persists delete across reopen", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const inserted = await db.insert({ user: { name: "delete-persist" } });
+    await db.flush();
+    await db.delete(inserted.docId);
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    const matches = await reopened.search({ where: { "user.name": { eq: "delete-persist" } } });
+    expect(matches.count).toBe(0);
+    await reopened.close();
+  });
+
+  it("updates a document as a new visible version", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const inserted = await db.insert({ user: { name: "old" } });
+    const updated = await db.update(inserted.docId, { user: { name: "new" } });
+    expect(updated.docId).not.toBe(inserted.docId);
+    expect((await db.search({ where: { "user.name": { eq: "old" } } })).count).toBe(0);
+    expect((await db.search({ where: { "user.name": { eq: "new" } } })).count).toBe(1);
+    await db.close();
+  });
+
+  it("persists update across reopen without returning old versions", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const inserted = await db.insert({ user: { name: "old-disk" } });
+    await db.flush();
+    await db.update(inserted.docId, { user: { name: "new-disk" } });
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "old-disk" } } })).count).toBe(0);
+    expect((await reopened.search({ where: { "user.name": { eq: "new-disk" } } })).count).toBe(1);
+    await reopened.close();
+  });
+
+  it("replays WAL delete state", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "wal-delete" } });
+    await db.close();
+    await writeFile(
+      join(path, "WAL-000001.log"),
+      encodeWal({
+        format: "sabli-wal-record",
+        version: 1,
+        sequence: 2,
+        type: "delete",
+        docId: toDocId(1)
+      })
+    );
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "wal-delete" } } })).count).toBe(0);
+    await reopened.close();
+  });
+
+  it("replays WAL update state represented as delete plus insert", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "wal-old" } });
+    await db.close();
+    await writeFile(
+      join(path, "WAL-000001.log"),
+      `${encodeWal({
+        format: "sabli-wal-record",
+        version: 1,
+        sequence: 2,
+        type: "delete",
+        docId: toDocId(1)
+      })}${encodeWal({
+        format: "sabli-wal-record",
+        version: 1,
+        sequence: 3,
+        type: "insert",
+        docId: toDocId(2),
+        document: { user: { name: "wal-new" } }
+      })}`
+    );
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "wal-old" } } })).count).toBe(0);
+    expect((await reopened.search({ where: { "user.name": { eq: "wal-new" } } })).count).toBe(1);
+    await reopened.close();
+  });
+
   it("prevents writes after close", async () => {
     const path = await tempDbPath();
     const db = await SabliDatabase.open({ path, createIfMissing: true });

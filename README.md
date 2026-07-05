@@ -46,6 +46,35 @@ console.log(results.documents);
 await db.close();
 ```
 
+## Delete And Update
+
+Delete writes a tombstone to the WAL before the call resolves:
+
+```ts
+const inserted = await db.insert({
+  user: { name: "Lee", age: 28 },
+  tags: ["frontend"]
+});
+
+await db.delete(inserted.docId);
+```
+
+Update is implemented as a new visible document version plus a tombstone for the old document identifier:
+
+```ts
+const first = await db.insert({
+  user: { name: "Park", role: "developer" }
+});
+
+const next = await db.update(first.docId, {
+  user: { name: "Park", role: "architect" }
+});
+
+console.log(next.docId);
+```
+
+Search never returns deleted documents or superseded old versions. Disk segments use versioned `delete.bitmap` files to filter tombstoned identifiers before raw documents are fetched.
+
 ## Query Examples
 
 Field-map syntax:
@@ -106,8 +135,14 @@ database.sabli/
       delete.bitmap
 ```
 
-Inserts are appended to the WAL before they are acknowledged in strict durability mode. `flush()` writes the current memory segment to an immutable disk segment and updates the manifest atomically.
+Inserts, deletes, and updates are appended to the WAL before they are acknowledged in strict durability mode. `flush()` writes the current memory segment to an immutable disk segment and updates the manifest atomically.
+
+## Durability And Recovery
+
+The default durability mode is `strict`, which asks Node.js to flush WAL appends before acknowledging writes. On startup, SABLI reads `CURRENT`, validates the active manifest, opens immutable segments, loads delete bitmaps, and replays valid WAL records newer than the manifest checkpoint.
+
+Partial trailing WAL records are handled deterministically by stopping at the last valid record. Checksum mismatches are treated as controlled recovery errors.
 
 ## Current Limitations
 
-This release is a persistent correctness foundation. Compaction, optimized posting encodings, delete bitmaps, full update/delete APIs, and advanced scope-aware array `elemMatch` semantics are planned future work.
+This release is a persistent correctness foundation. Compaction is still future work, so deleted and superseded versions may remain on disk until a later compaction milestone. Optimized posting encodings, richer delete bitmap management, and advanced scope-aware array `elemMatch` semantics are also planned future work.
