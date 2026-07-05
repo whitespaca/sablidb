@@ -28,6 +28,9 @@ export function parseSabliOptions(input: unknown): SabliOptions {
   }
   const options = result.value ?? {};
   const bloom = options.bloom ?? {};
+  if (bloom.falsePositiveRate !== undefined && (bloom.falsePositiveRate <= 0 || bloom.falsePositiveRate >= 1)) {
+    throw new SabliValidationError("Invalid options: bloom.falsePositiveRate must be greater than 0 and less than 1.");
+  }
   return {
     mutableSegmentMaxDocuments: options.mutableSegmentMaxDocuments ?? DEFAULT_SABLI_OPTIONS.mutableSegmentMaxDocuments,
     bloom: {

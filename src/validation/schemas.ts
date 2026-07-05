@@ -48,7 +48,7 @@ export const OptionsInputGuard = compile(
   t.object({
     mutableSegmentMaxDocuments: t.number.int().gte(1).optional(),
     bloom: t.object({
-      falsePositiveRate: t.number.gt(0).lt(1).optional(),
+      falsePositiveRate: t.number.gte(0).lte(1).optional(),
       expectedEntries: t.number.int().gte(1).optional()
     }).optional()
   }).optional(),
@@ -58,7 +58,7 @@ export const OptionsInputGuard = compile(
 /**
  * TypeSea guard for a positive public document identifier.
  */
-export const DocIdInputGuard = compile(
+export const DocIdInputGuard: Guard<number> = compile(
   t.number.int().gte(1),
   { name: "isSabliDocIdInput" }
 );
