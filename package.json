@@ -30,8 +30,12 @@
     "bloom-filter",
     "lsm"
   ],
-  "author": "",
+  "author": "whitespaca",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sabli/sabli.git"
+  },
   "engines": {
     "node": ">=22"
   },
