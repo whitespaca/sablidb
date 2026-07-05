@@ -1,9 +1,9 @@
 # SABLI
 
-[![npm version](https://img.shields.io/npm/v/@whitespaca/sabli.svg)](https://www.npmjs.com/package/@whitespaca/sabli)
+[![npm version](https://img.shields.io/npm/v/sablidb.svg)](https://www.npmjs.com/package/sablidb)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-![npm](https://img.shields.io/npm/dt/@whitespaca/sabli)
+![npm](https://img.shields.io/npm/dt/sablidb)
 
 SABLI is an ESModule-only TypeScript library for indexing and searching unordered schema-less JSON documents. SABLI stands for Segmented Adaptive Bloom-LSM Inverted Index.
 
@@ -12,7 +12,7 @@ This initial package provides a correctness-first embedded database with a memor
 ## Installation
 
 ```bash
-npm install @whitespaca/sabli
+npm install sablidb
 ```
 
 SABLI targets Node.js 22 or later and is published as ESModule only.
@@ -20,7 +20,7 @@ SABLI targets Node.js 22 or later and is published as ESModule only.
 ## Basic Usage
 
 ```ts
-import { SabliDatabase } from "@whitespaca/sabli";
+import { SabliDatabase } from "sablidb";
 
 const db = await SabliDatabase.open({
   path: "./data/users.sabli",
