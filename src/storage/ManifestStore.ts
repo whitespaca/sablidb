@@ -37,6 +37,8 @@ export interface DatabaseManifest {
   readonly segments: readonly ManifestSegmentEntry[];
   /** Last WAL sequence included in durable immutable segments. */
   readonly flushedWalSequence: number;
+  /** Active WAL generation for new writes. */
+  readonly activeWalGeneration: number;
   /** Checksum over the manifest payload. */
   readonly checksum: string;
 }
@@ -71,7 +73,8 @@ export class ManifestStore {
       nextDocId: toDocId(1),
       nextSegmentId: toSegmentId(1),
       segments: [],
-      flushedWalSequence: 0
+      flushedWalSequence: 0,
+      activeWalGeneration: 1
     });
   }
 
@@ -108,7 +111,8 @@ export class ManifestStore {
       nextDocId: input.nextDocId,
       nextSegmentId: input.nextSegmentId,
       segments: input.segments,
-      flushedWalSequence: input.flushedWalSequence
+      flushedWalSequence: input.flushedWalSequence,
+      activeWalGeneration: input.activeWalGeneration
     };
     return { ...payload, checksum: checksum(stableJson(payload)) };
   }
@@ -139,6 +143,10 @@ export function parseDatabaseManifest(input: unknown): DatabaseManifest {
   if (typeof record.flushedWalSequence !== "number" || !Number.isInteger(record.flushedWalSequence) || record.flushedWalSequence < 0) {
     throw new SabliCorruptionError("Invalid manifest: flushedWalSequence must be a non-negative integer.");
   }
+  const activeWalGeneration = record.activeWalGeneration ?? 1;
+  if (typeof activeWalGeneration !== "number" || !Number.isInteger(activeWalGeneration) || activeWalGeneration < 1) {
+    throw new SabliCorruptionError("Invalid manifest: activeWalGeneration must be a positive integer.");
+  }
   if (!Array.isArray(record.segments)) {
     throw new SabliCorruptionError("Invalid manifest: segments must be an array.");
   }
@@ -167,9 +175,19 @@ export function parseDatabaseManifest(input: unknown): DatabaseManifest {
     nextDocId: record.nextDocId,
     nextSegmentId: record.nextSegmentId,
     segments: record.segments,
+    flushedWalSequence: record.flushedWalSequence,
+    activeWalGeneration
+  };
+  const legacyPayload = {
+    format: record.format,
+    version: record.version,
+    nextDocId: record.nextDocId,
+    nextSegmentId: record.nextSegmentId,
+    segments: record.segments,
     flushedWalSequence: record.flushedWalSequence
   };
-  if (checksum(stableJson(payload)) !== record.checksum) {
+  const expectedChecksum = record.activeWalGeneration === undefined ? checksum(stableJson(legacyPayload)) : checksum(stableJson(payload));
+  if (expectedChecksum !== record.checksum) {
     throw new SabliCorruptionError("Invalid manifest: checksum mismatch.");
   }
   return {
@@ -178,6 +196,7 @@ export function parseDatabaseManifest(input: unknown): DatabaseManifest {
     nextDocId: toDocId(record.nextDocId),
     nextSegmentId: toSegmentId(record.nextSegmentId),
     flushedWalSequence: record.flushedWalSequence,
+    activeWalGeneration,
     segments,
     checksum: record.checksum
   };

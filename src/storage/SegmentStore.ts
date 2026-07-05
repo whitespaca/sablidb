@@ -1,3 +1,4 @@
+import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { ImmutableSegment } from "../segment/ImmutableSegment.js";
 import { SegmentWriter } from "../segment/SegmentWriter.js";
@@ -37,5 +38,33 @@ export class SegmentStore {
    */
   public async open(entry: ManifestSegmentEntry): Promise<ImmutableSegment> {
     return ImmutableSegment.open(join(this.#root, entry.path));
+  }
+
+  /**
+   * Removes temporary segment directories left by interrupted writes.
+   */
+  public async cleanupTemporarySegments(): Promise<void> {
+    const segmentsRoot = join(this.#root, "segments");
+    const entries = await readdir(segmentsRoot, { withFileTypes: true }).catch(() => []);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.isDirectory() && entry.name.endsWith(".tmp"))
+        .map((entry) => rm(join(segmentsRoot, entry.name), { recursive: true, force: true }))
+    );
+  }
+
+  /**
+   * Removes segment directories that are not referenced by the active manifest.
+   *
+   * @param livePaths - Relative segment paths that must be preserved.
+   */
+  public async cleanupObsoleteSegments(livePaths: ReadonlySet<string>): Promise<void> {
+    const segmentsRoot = join(this.#root, "segments");
+    const entries = await readdir(segmentsRoot, { withFileTypes: true }).catch(() => []);
+    await Promise.all(
+      entries
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith("seg-") && !livePaths.has(`segments/${entry.name}`))
+        .map((entry) => rm(join(segmentsRoot, entry.name), { recursive: true, force: true }))
+    );
   }
 }

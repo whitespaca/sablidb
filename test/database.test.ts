@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ import {
 import { checksum, stableJson } from "../src/storage/Checksum.js";
 import { toDocId } from "../src/types/json.js";
 import type { WalRecord } from "../src/storage/WalStore.js";
+import { parseDatabaseManifest } from "../src/storage/ManifestStore.js";
 
 const roots: string[] = [];
 
@@ -26,6 +27,15 @@ afterEach(async () => {
 
 function encodeWal(record: WalRecord): string {
   return `${JSON.stringify({ record, checksum: checksum(stableJson(record)) })}\n`;
+}
+
+async function activeWalPath(path: string): Promise<string> {
+  const manifest = parseDatabaseManifest(JSON.parse(await readFile(join(path, "MANIFEST-000001"), "utf8")));
+  return join(path, `WAL-${String(manifest.activeWalGeneration).padStart(6, "0")}.log`);
+}
+
+async function segmentNames(path: string): Promise<readonly string[]> {
+  return (await readdir(join(path, "segments"))).filter((name) => name.startsWith("seg-")).sort();
 }
 
 describe("SabliDatabase persistence", () => {
@@ -60,7 +70,7 @@ describe("SabliDatabase persistence", () => {
     await db.insert({ user: { name: "flushed" } });
     await db.close();
     await writeFile(
-      join(path, "WAL-000001.log"),
+      await activeWalPath(path),
       encodeWal({
         format: "sabli-wal-record",
         version: 1,
@@ -96,7 +106,7 @@ describe("SabliDatabase persistence", () => {
       docId: toDocId(2),
       document: { user: { name: "valid" } }
     });
-    await writeFile(join(path, "WAL-000001.log"), `${wal}{not-json`);
+    await writeFile(await activeWalPath(path), `${wal}{not-json`);
     const reopened = await SabliDatabase.open({ path, createIfMissing: false });
     const matches = await reopened.search({ where: { "user.name": { eq: "valid" } } });
     expect(matches.count).toBe(1);
@@ -190,7 +200,7 @@ describe("SabliDatabase persistence", () => {
     await db.insert({ user: { name: "wal-delete" } });
     await db.close();
     await writeFile(
-      join(path, "WAL-000001.log"),
+      await activeWalPath(path),
       encodeWal({
         format: "sabli-wal-record",
         version: 1,
@@ -210,7 +220,7 @@ describe("SabliDatabase persistence", () => {
     await db.insert({ user: { name: "wal-old" } });
     await db.close();
     await writeFile(
-      join(path, "WAL-000001.log"),
+      await activeWalPath(path),
       `${encodeWal({
         format: "sabli-wal-record",
         version: 1,
@@ -247,6 +257,77 @@ describe("SabliDatabase persistence", () => {
     const path = await tempDbPath();
     const db = await SabliDatabase.open({ path, createIfMissing: true });
     await expect(db.search({ where: { and: [] } })).rejects.toThrow(SabliValidationError);
+    await db.close();
+  });
+
+  it("compaction preserves visible documents and replaces old segments", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true, memSegmentMaxDocuments: 1 });
+    await db.insert({ user: { name: "one" }, tags: ["live"] });
+    await db.insert({ user: { name: "two" }, tags: ["live"] });
+    expect(await segmentNames(path)).toHaveLength(2);
+    const before = await db.search({ where: { "tags[]": { contains: "live" } } });
+    await db.compact();
+    const after = await db.search({ where: { "tags[]": { contains: "live" } } });
+    expect(after.documents).toEqual(before.documents);
+    expect(await segmentNames(path)).toHaveLength(1);
+    await db.close();
+  });
+
+  it("compaction removes deleted documents from the compacted segment", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const deleted = await db.insert({ user: { name: "deleted" } });
+    await db.insert({ user: { name: "kept" } });
+    await db.flush();
+    await db.delete(deleted.docId);
+    await db.compact();
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "deleted" } } })).count).toBe(0);
+    expect((await reopened.search({ where: { "user.name": { eq: "kept" } } })).count).toBe(1);
+    await reopened.close();
+  });
+
+  it("compaction removes superseded versions after update", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const old = await db.insert({ user: { name: "old-compact" } });
+    await db.flush();
+    await db.update(old.docId, { user: { name: "new-compact" } });
+    await db.compact();
+    await db.close();
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "old-compact" } } })).count).toBe(0);
+    expect((await reopened.search({ where: { "user.name": { eq: "new-compact" } } })).count).toBe(1);
+    await reopened.close();
+  });
+
+  it("update then delete followed by compaction returns no document", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const old = await db.insert({ user: { name: "gone-old" } });
+    await db.flush();
+    const replacement = await db.update(old.docId, { user: { name: "gone-new" } });
+    await db.delete(replacement.docId);
+    await db.compact();
+    expect((await db.search({ where: { "user.name": { eq: "gone-old" } } })).count).toBe(0);
+    expect((await db.search({ where: { "user.name": { eq: "gone-new" } } })).count).toBe(0);
+    await db.close();
+  });
+
+  it("checkpoint advances and rotates WAL after compaction", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "checkpoint" } });
+    await db.flush();
+    const before = parseDatabaseManifest(JSON.parse(await readFile(join(path, "MANIFEST-000001"), "utf8")));
+    await db.compact();
+    const after = parseDatabaseManifest(JSON.parse(await readFile(join(path, "MANIFEST-000001"), "utf8")));
+    expect(after.flushedWalSequence).toBeGreaterThanOrEqual(before.flushedWalSequence);
+    expect(after.activeWalGeneration).toBeGreaterThan(before.activeWalGeneration);
+    await db.insert({ user: { name: "after-checkpoint" } });
+    await expect(readFile(await activeWalPath(path), "utf8")).resolves.toContain("after-checkpoint");
     await db.close();
   });
 });

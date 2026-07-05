@@ -201,6 +201,18 @@ console.log(next.docId);
 
 Search never returns deleted documents or superseded old versions. Disk segments use versioned `delete.bitmap` files to filter tombstoned identifiers before raw documents are fetched.
 
+## Manual Compaction
+
+Compaction rewrites visible documents from immutable segments into a new immutable segment, then atomically updates the manifest so old segments are no longer referenced.
+
+```ts
+await db.compact();
+```
+
+The v1.2 compaction policy is deliberately simple and deterministic: when `compact()` is called, SABLI flushes the current memory segment, reads all visible documents from all immutable segments, writes one compacted replacement segment, rotates to a new WAL generation, and removes unreferenced old segment directories after the manifest swap succeeds.
+
+Compaction removes deleted documents and superseded old update versions from future compacted segments. It is manual in this milestone; no background or automatic compaction is started by the library.
+
 ## Query Examples
 
 Field-map syntax:
@@ -266,7 +278,7 @@ Indexes and Bloom filters only generate candidate documents. SABLI verifies ever
 
 ## Disk Layout
 
-A SABLI database is a directory with a lock file, `CURRENT`, a versioned manifest, one append-only WAL file, and immutable segment directories:
+A SABLI database is a directory with a lock file, `CURRENT`, a versioned manifest, append-only WAL generation files, and immutable segment directories:
 
 ```txt
 database.sabli/
@@ -274,6 +286,7 @@ database.sabli/
   CURRENT
   MANIFEST-000001
   WAL-000001.log
+  WAL-000002.log
   segments/
     seg-000001/
       segment.meta.json
@@ -286,21 +299,23 @@ database.sabli/
       delete.bitmap
 ```
 
-Inserts, deletes, and updates are appended to the WAL before they are acknowledged in strict durability mode. `flush()` writes the current memory segment to an immutable disk segment and updates the manifest atomically.
+Inserts, deletes, and updates are appended to the active WAL generation before they are acknowledged in strict durability mode. `flush()` writes the current memory segment to an immutable disk segment, checkpoints the WAL sequence, rotates to a new WAL generation, and updates the manifest atomically.
 
 ## Durability And Recovery
 
-The default durability mode is `strict`, which asks Node.js to flush WAL appends before acknowledging writes. On startup, SABLI reads `CURRENT`, validates the active manifest, opens immutable segments, loads delete bitmaps, and replays valid WAL records newer than the manifest checkpoint.
+The default durability mode is `strict`, which asks Node.js to flush WAL appends before acknowledging writes. On startup, SABLI reads `CURRENT`, validates the active manifest, opens immutable segments, loads delete bitmaps, identifies the active WAL generation, and replays valid WAL records newer than the manifest checkpoint.
 
 Partial trailing WAL records are handled deterministically by stopping at the last valid record. Checksum mismatches are treated as controlled recovery errors.
 
+Checkpointing records the highest WAL sequence already represented by immutable segments. After flush or compaction, new writes go to the next WAL generation. Obsolete WAL generations are not required after a successful checkpoint.
+
 ## Current Limitations
 
-This release is a persistent correctness foundation. Compaction is still future work, so deleted and superseded versions may remain on disk until a later compaction milestone. Optimized posting encodings, richer delete bitmap management, and advanced scope-aware array `elemMatch` semantics are also planned future work.
+This release includes manual compaction and WAL generation checkpointing. Automatic background compaction, advanced compaction selection, optimized posting encodings, and advanced scope-aware array `elemMatch` semantics remain future work.
 
 ## Future Roadmap
 
-- Segment compaction and obsolete-version cleanup.
+- Automatic compaction scheduling and richer compaction selection.
 - More compact posting encodings.
 - Larger-scale lazy loading and cache controls.
 - Richer scoped array matching.

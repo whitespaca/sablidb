@@ -14,8 +14,6 @@ export interface DatabasePaths {
   readonly current: string;
   /** Segment parent directory. */
   readonly segments: string;
-  /** Active WAL file path. */
-  readonly wal: string;
 }
 
 /**
@@ -34,8 +32,7 @@ export class DatabaseDirectory {
       root,
       lock: join(root, "LOCK"),
       current: join(root, "CURRENT"),
-      segments: join(root, "segments"),
-      wal: join(root, "WAL-000001.log")
+      segments: join(root, "segments")
     };
   }
 
@@ -83,6 +80,16 @@ export class DatabaseDirectory {
    */
   public async writeCurrent(manifestName: string): Promise<void> {
     await writeFile(this.#paths.current, `${manifestName}\n`);
+  }
+
+  /**
+   * Resolves a WAL file path for a generation number.
+   *
+   * @param generation - Positive WAL generation.
+   * @returns Absolute WAL file path.
+   */
+  public walPath(generation: number): string {
+    return join(this.#paths.root, `WAL-${String(generation).padStart(6, "0")}.log`);
   }
 }
 

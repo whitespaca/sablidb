@@ -92,6 +92,17 @@ export class ImmutableSegment {
   }
 
   /**
+   * Reads all currently visible documents from this immutable segment.
+   *
+   * @returns Visible documents paired with their document identifiers.
+   */
+  public async readLiveDocuments(): Promise<readonly { readonly docId: DocId; readonly document: JsonObject }[]> {
+    const reader = await this.documentReader();
+    const documents = await reader.readAll();
+    return documents.filter(({ docId }) => !this.isDeleted(docId));
+  }
+
+  /**
    * Marks a document identifier deleted in this immutable segment.
    *
    * @param docId - Document identifier to tombstone.

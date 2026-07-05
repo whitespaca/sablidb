@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { SabliDatabaseClosedError, SabliStorageError, SabliValidationError } from "../errors/index.js";
 import type { InsertResult, Query, SearchResult } from "../query/ast.js";
 import { verifyDocument } from "../query/verifier.js";
@@ -24,7 +24,7 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
   readonly #options: SabliDatabaseOptions;
   readonly #directory: DatabaseDirectory;
   readonly #manifestStore: ManifestStore;
-  readonly #wal: WalStore;
+  #wal: WalStore;
   readonly #segmentStore: SegmentStore;
   readonly #lock: FileLock;
   readonly #segments: ImmutableSegment[];
@@ -91,7 +91,8 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       for (const entry of manifest.segments) {
         segments.push(await segmentStore.open(entry));
       }
-      const wal = new WalStore(directory.paths.wal);
+      await segmentStore.cleanupTemporarySegments();
+      const wal = new WalStore(directory.walPath(manifest.activeWalGeneration));
       await wal.ensure();
       const replay = await wal.replay(manifest.flushedWalSequence);
       const mem = new MemSegment<TDocument>({ expectedEntries: 10_000, falsePositiveRate: 0.01 });
@@ -279,12 +280,61 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       nextSegmentId: toSegmentId(Number(segmentId) + 1),
       segments: [...this.#manifest.segments, entry],
       flushedWalSequence: snapshot.lastWalSequence,
+      activeWalGeneration: this.#manifest.activeWalGeneration + 1,
       checksum: ""
     };
     await this.#manifestStore.write(this.#manifest);
     this.#segments.push(await this.#segmentStore.open(entry));
     this.#mem.clear();
-    await this.#wal.reset();
+    await this.rotateWalAfterCheckpoint(this.#manifest.activeWalGeneration - 1);
+  }
+
+  /**
+   * Compacts all immutable segments into a single immutable segment containing only visible documents.
+   *
+   * @param options - Optional compaction controls. The first implementation compacts all immutable segments when called.
+   * @throws {SabliDatabaseClosedError} If the database has been closed.
+   * @throws {SabliStorageError} If compaction storage work fails.
+   */
+  public async compact(options?: { readonly force?: boolean }): Promise<void> {
+    this.assertOpen();
+    void options;
+    await this.flush();
+    const liveDocuments: { readonly docId: DocId; readonly document: TDocument }[] = [];
+    for (const segment of this.#segments) {
+      for (const row of await segment.readLiveDocuments()) {
+        liveDocuments.push({ docId: row.docId, document: row.document as TDocument });
+      }
+    }
+    liveDocuments.sort((left, right) => Number(left.docId) - Number(right.docId));
+
+    const segmentId = this.#manifest.nextSegmentId;
+    const entry = await this.#segmentStore.writer.write(segmentId, {
+      documents: liveDocuments,
+      lastWalSequence: this.#manifest.flushedWalSequence
+    });
+    const oldSegments = [...this.#segments];
+    this.#manifest = {
+      format: "sabli-manifest",
+      version: 1,
+      nextDocId: this.#manifest.nextDocId,
+      nextSegmentId: toSegmentId(Number(segmentId) + 1),
+      segments: liveDocuments.length === 0 ? [] : [entry],
+      flushedWalSequence: this.#manifest.flushedWalSequence,
+      activeWalGeneration: this.#manifest.activeWalGeneration + 1,
+      checksum: ""
+    };
+    await this.#manifestStore.write(this.#manifest);
+
+    for (const segment of oldSegments) {
+      await segment.close();
+    }
+    this.#segments.length = 0;
+    if (liveDocuments.length > 0) {
+      this.#segments.push(await this.#segmentStore.open(entry));
+    }
+    await this.rotateWalAfterCheckpoint(this.#manifest.activeWalGeneration - 1);
+    await this.#segmentStore.cleanupObsoleteSegments(new Set(this.#manifest.segments.map((segment) => segment.path)));
   }
 
   /**
@@ -320,6 +370,12 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       this.#mem.delete(docId, sequence);
     }
     await Promise.all(this.#segments.map((segment) => segment.markDeleted(docId)));
+  }
+
+  private async rotateWalAfterCheckpoint(previousGeneration: number): Promise<void> {
+    this.#wal = new WalStore(this.#directory.walPath(this.#manifest.activeWalGeneration));
+    await this.#wal.ensure();
+    await rm(this.#directory.walPath(previousGeneration), { force: true });
   }
 
   private async isVisible(docId: DocId): Promise<boolean> {

@@ -1,4 +1,4 @@
-import { appendFile, readFile, writeFile } from "node:fs/promises";
+import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import { SabliRecoveryError, SabliStorageError } from "../errors/index.js";
 import type { JsonObject } from "../types/json.js";
 import { toDocId, type DocId } from "../types/json.js";
@@ -156,6 +156,13 @@ export class WalStore {
    */
   public async reset(): Promise<void> {
     await writeFile(this.#path, "");
+  }
+
+  /**
+   * Removes this WAL file when it is no longer referenced by the active manifest.
+   */
+  public async remove(): Promise<void> {
+    await rm(this.#path, { force: true });
   }
 
   private parseEnvelope(line: string): WalRecord | undefined {
