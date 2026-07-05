@@ -1,5 +1,5 @@
 {
-  "name": "@whitespaca/sabli",
+  "name": "sablidb",
   "version": "1.0.0",
   "description": "Segmented Adaptive Bloom-LSM Inverted Index for JSON documents.",
   "type": "module",
