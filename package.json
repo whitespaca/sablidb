@@ -1,5 +1,5 @@
 {
-  "name": "sabli",
+  "name": "@whitespaca/sabli",
   "version": "0.1.0",
   "description": "Segmented Adaptive Bloom-LSM Inverted Index for JSON documents.",
   "type": "module",
@@ -9,6 +9,9 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist",

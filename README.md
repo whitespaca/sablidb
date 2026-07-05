@@ -7,7 +7,7 @@ This initial package provides a correctness-first in-memory mutable segment with
 ## Installation
 
 ```bash
-npm install sabli
+npm install @whitespaca/sabli
 ```
 
 SABLI targets Node.js 22 or later and is published as ESModule only.
@@ -15,7 +15,7 @@ SABLI targets Node.js 22 or later and is published as ESModule only.
 ## Basic Usage
 
 ```ts
-import { SabliEngine } from "sabli";
+import { SabliEngine } from "@whitespaca/sabli";
 
 const engine = new SabliEngine();
 
