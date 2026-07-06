@@ -44,7 +44,7 @@ export interface WalDeleteRecord {
 }
 
 /**
- * Future update WAL payload.
+ * Atomic update WAL payload.
  */
 export interface WalUpdateRecord {
   /** WAL record format marker. */
@@ -55,8 +55,10 @@ export interface WalUpdateRecord {
   readonly sequence: number;
   /** Record operation type. */
   readonly type: "update";
-  /** Updated document identifier. */
-  readonly docId: DocId;
+  /** Superseded document identifier. */
+  readonly oldDocId: DocId;
+  /** Replacement document identifier. */
+  readonly newDocId: DocId;
   /** Replacement JSON document. */
   readonly document: JsonObject;
 }
@@ -173,13 +175,14 @@ export class WalStore {
     } catch {
       return undefined;
     }
-    if (!WalEnvelopeInputGuard.is(value)) {
-      return undefined;
+    const envelope = WalEnvelopeInputGuard.check(value);
+    if (!envelope.ok) {
+      throw new SabliRecoveryError("Invalid WAL record: malformed envelope.");
     }
-    if (checksum(stableJson(value.record)) !== value.checksum) {
+    if (checksum(stableJson(envelope.value.record)) !== envelope.value.checksum) {
       throw new SabliRecoveryError("Invalid WAL record: checksum mismatch.");
     }
-    return parseWalRecord(value.record);
+    return parseWalRecord(envelope.value.record);
   }
 }
 
@@ -194,6 +197,17 @@ export function parseWalRecord(input: unknown): WalRecord {
   const record = assertValid(WalRecordInputGuard, input, "recovery", "Invalid WAL record.");
   if (record.type === "delete") {
     return { format: "sabli-wal-record", version: 1, sequence: record.sequence, type: "delete", docId: toDocId(record.docId) };
+  }
+  if (record.type === "update") {
+    return {
+      format: "sabli-wal-record",
+      version: 1,
+      sequence: record.sequence,
+      type: "update",
+      oldDocId: toDocId(record.oldDocId),
+      newDocId: toDocId(record.newDocId),
+      document: record.document
+    };
   }
   return {
     format: "sabli-wal-record",

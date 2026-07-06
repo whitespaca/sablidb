@@ -101,9 +101,16 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       const mem = new MemSegment<TDocument>({ expectedEntries: 10_000, falsePositiveRate: 0.01 });
       let nextDocId = Number(manifest.nextDocId);
       for (const record of replay.records) {
-        if (record.type === "insert" || record.type === "update") {
+        if (record.type === "insert") {
           mem.insertWithDocId(record.docId, record.document as TDocument, record.sequence);
           nextDocId = Math.max(nextDocId, Number(record.docId) + 1);
+          continue;
+        }
+        if (record.type === "update") {
+          mem.delete(record.oldDocId, record.sequence);
+          await Promise.all(segments.map((segment) => segment.markDeleted(record.oldDocId)));
+          mem.insertWithDocId(record.newDocId, record.document as TDocument, record.sequence);
+          nextDocId = Math.max(nextDocId, Number(record.newDocId) + 1);
           continue;
         }
         mem.delete(record.docId, record.sequence);
@@ -202,29 +209,21 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       throw new SabliStorageError("Cannot update document: docId is not visible.");
     }
     const parsed = parseJsonDocument(document) as TDocument;
-    const deleteSequence = this.#nextWalSequence;
+    const sequence = this.#nextWalSequence;
     const newDocId = this.#manifest.nextDocId;
-    const insertSequence = deleteSequence + 1;
-    const deleteRecord: WalRecord = {
+    const record: WalRecord = {
       format: "sabli-wal-record",
       version: 1,
-      sequence: deleteSequence,
-      type: "delete",
-      docId: oldDocId
-    };
-    const insertRecord: WalRecord = {
-      format: "sabli-wal-record",
-      version: 1,
-      sequence: insertSequence,
-      type: "insert",
-      docId: newDocId,
+      sequence,
+      type: "update",
+      oldDocId,
+      newDocId,
       document: parsed
     };
-    await this.#wal.append(deleteRecord, this.#options.durability === "strict");
-    await this.#wal.append(insertRecord, this.#options.durability === "strict");
-    await this.applyDelete(oldDocId, deleteSequence);
-    const entryCount = this.#mem.insertWithDocId(newDocId, parsed, insertSequence);
-    this.#nextWalSequence += 2;
+    await this.#wal.append(record, this.#options.durability === "strict");
+    await this.applyDelete(oldDocId, sequence);
+    const entryCount = this.#mem.insertWithDocId(newDocId, parsed, sequence);
+    this.#nextWalSequence += 1;
     this.#manifest = { ...this.#manifest, nextDocId: toDocId(Number(newDocId) + 1) };
     if (this.#mem.documentCount >= this.#options.memSegmentMaxDocuments) {
       await this.flush();

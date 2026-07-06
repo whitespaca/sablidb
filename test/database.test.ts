@@ -7,12 +7,14 @@ import {
   SabliDatabase,
   SabliDatabaseClosedError,
   SabliRecoveryError,
+  SabliStorageError,
   SabliValidationError
 } from "../src/index.js";
 import { checksum, stableJson } from "../src/storage/Checksum.js";
-import { toDocId } from "../src/types/json.js";
+import { toDocId, toSegmentId } from "../src/types/json.js";
 import type { WalRecord } from "../src/storage/WalStore.js";
 import { parseDatabaseManifest } from "../src/storage/ManifestStore.js";
+import { SegmentWriter } from "../src/segment/SegmentWriter.js";
 
 const roots: string[] = [];
 
@@ -248,10 +250,53 @@ describe("SabliDatabase persistence", () => {
     await reopened.close();
   });
 
-  it("replays WAL update state represented as delete plus insert", async () => {
+  it("writes update as one atomic WAL record", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    const inserted = await db.insert({ user: { name: "atomic-old" } });
+    await db.flush();
+    const updated = await db.update(inserted.docId, { user: { name: "atomic-new" } });
+    const walText = await readFile(await activeWalPath(path), "utf8");
+    const lines = walText.trim().split("\n");
+    expect(lines).toHaveLength(1);
+    const envelope = JSON.parse(lines[0] ?? "{}") as { record?: unknown };
+    expect(envelope.record).toMatchObject({
+      type: "update",
+      sequence: 2,
+      oldDocId: inserted.docId,
+      newDocId: updated.docId
+    });
+    expect(envelope.record).not.toHaveProperty("docId");
+    await db.close();
+  });
+
+  it("replays atomic WAL update state", async () => {
     const path = await tempDbPath();
     const db = await SabliDatabase.open({ path, createIfMissing: true });
     await db.insert({ user: { name: "wal-old" } });
+    await db.close();
+    await writeFile(
+      await activeWalPath(path),
+      encodeWal({
+        format: "sabli-wal-record",
+        version: 1,
+        sequence: 2,
+        type: "update",
+        oldDocId: toDocId(1),
+        newDocId: toDocId(2),
+        document: { user: { name: "wal-new" } }
+      })
+    );
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "wal-old" } } })).count).toBe(0);
+    expect((await reopened.search({ where: { "user.name": { eq: "wal-new" } } })).count).toBe(1);
+    await reopened.close();
+  });
+
+  it("replays update followed by delete without resurrecting either version", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "wal-update-delete-old" } });
     await db.close();
     await writeFile(
       await activeWalPath(path),
@@ -259,21 +304,79 @@ describe("SabliDatabase persistence", () => {
         format: "sabli-wal-record",
         version: 1,
         sequence: 2,
-        type: "delete",
-        docId: toDocId(1)
+        type: "update",
+        oldDocId: toDocId(1),
+        newDocId: toDocId(2),
+        document: { user: { name: "wal-update-delete-new" } }
       })}${encodeWal({
         format: "sabli-wal-record",
         version: 1,
         sequence: 3,
-        type: "insert",
-        docId: toDocId(2),
-        document: { user: { name: "wal-new" } }
+        type: "delete",
+        docId: toDocId(2)
       })}`
     );
     const reopened = await SabliDatabase.open({ path, createIfMissing: false });
-    expect((await reopened.search({ where: { "user.name": { eq: "wal-old" } } })).count).toBe(0);
-    expect((await reopened.search({ where: { "user.name": { eq: "wal-new" } } })).count).toBe(1);
+    expect((await reopened.search({ where: { "user.name": { eq: "wal-update-delete-old" } } })).count).toBe(0);
+    expect((await reopened.search({ where: { "user.name": { eq: "wal-update-delete-new" } } })).count).toBe(0);
     await reopened.close();
+  });
+
+  it("compacts correctly after replaying an atomic update", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "wal-compact-old" } });
+    await db.close();
+    await writeFile(
+      await activeWalPath(path),
+      encodeWal({
+        format: "sabli-wal-record",
+        version: 1,
+        sequence: 2,
+        type: "update",
+        oldDocId: toDocId(1),
+        newDocId: toDocId(2),
+        document: { user: { name: "wal-compact-new" } }
+      })
+    );
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    await reopened.compact();
+    await reopened.close();
+    const after = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await after.search({ where: { "user.name": { eq: "wal-compact-old" } } })).count).toBe(0);
+    expect((await after.search({ where: { "user.name": { eq: "wal-compact-new" } } })).count).toBe(1);
+    await after.close();
+  });
+
+  it("ignores a partial trailing atomic update WAL record", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "partial-update-old" } });
+    await db.close();
+    await writeFile(
+      await activeWalPath(path),
+      '{"record":{"format":"sabli-wal-record","version":1,"sequence":2,"type":"update"'
+    );
+    const reopened = await SabliDatabase.open({ path, createIfMissing: false });
+    expect((await reopened.search({ where: { "user.name": { eq: "partial-update-old" } } })).count).toBe(1);
+    expect((await reopened.search({ where: { "user.name": { eq: "partial-update-new" } } })).count).toBe(0);
+    await reopened.close();
+  });
+
+  it("rejects malformed atomic update WAL records deterministically", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.close();
+    const malformed = {
+      format: "sabli-wal-record",
+      version: 1,
+      sequence: 1,
+      type: "update",
+      docId: 1,
+      document: { user: { name: "legacy-shape" } }
+    };
+    await writeFile(await activeWalPath(path), `${JSON.stringify({ record: malformed, checksum: checksum(stableJson(malformed)) })}\n`);
+    await expect(SabliDatabase.open({ path, createIfMissing: false })).rejects.toThrow(SabliRecoveryError);
   });
 
   it("prevents writes after close", async () => {
@@ -306,6 +409,38 @@ describe("SabliDatabase persistence", () => {
     expect(after.documents).toEqual(before.documents);
     expect(await segmentNames(path)).toHaveLength(1);
     await db.close();
+  });
+
+  it("direct segment writes fail instead of overwriting existing segments", async () => {
+    const path = await tempDbPath();
+    await mkdir(join(path, "segments"), { recursive: true });
+    const writer = new SegmentWriter(join(path, "segments"), { expectedEntries: 10, falsePositiveRate: 0.01 });
+    await writer.write(toSegmentId(1), {
+      documents: [{ docId: toDocId(1), document: { user: { name: "kept-segment" } } }],
+      lastWalSequence: 1
+    });
+    const before = await readFile(join(path, "segments", "seg-000001", "segment.meta.json"), "utf8");
+    await expect(writer.write(toSegmentId(1), {
+      documents: [{ docId: toDocId(2), document: { user: { name: "overwrite-attempt" } } }],
+      lastWalSequence: 2
+    })).rejects.toThrow(SabliStorageError);
+    await expect(readFile(join(path, "segments", "seg-000001", "segment.meta.json"), "utf8")).resolves.toBe(before);
+    await expect(readdir(join(path, "segments"))).resolves.not.toContain("seg-000001.tmp");
+  });
+
+  it("failed segment writes do not change the active manifest", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true });
+    await db.insert({ user: { name: "manifest-stable" } });
+    await db.flush();
+    await db.close();
+    const before = await activeManifest(path);
+    const writer = new SegmentWriter(join(path, "segments"), { expectedEntries: 10, falsePositiveRate: 0.01 });
+    await expect(writer.write(before.segments[0]?.segmentId ?? toSegmentId(1), {
+      documents: [{ docId: toDocId(99), document: { user: { name: "blocked" } } }],
+      lastWalSequence: 99
+    })).rejects.toThrow(SabliStorageError);
+    expect(await activeManifest(path)).toEqual(before);
   });
 
   it("compacts an empty database without creating live segments", async () => {
@@ -341,6 +476,20 @@ describe("SabliDatabase persistence", () => {
     const after = await db.search({ where: { "tags[]": { contains: "stable" } } });
     expect(after.documents).toEqual(before.documents);
     expect(await segmentNames(path)).toHaveLength(1);
+    await db.close();
+  });
+
+  it("compaction never reuses a live segment id", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true, memSegmentMaxDocuments: 1 });
+    await db.insert({ user: { name: "segment-one" }, tags: ["reuse-check"] });
+    await db.insert({ user: { name: "segment-two" }, tags: ["reuse-check"] });
+    expect(await segmentNames(path)).toEqual(["seg-000001", "seg-000002"]);
+    await db.compact();
+    expect(await segmentNames(path)).toEqual(["seg-000003"]);
+    await db.compact();
+    expect(await segmentNames(path)).toEqual(["seg-000004"]);
+    expect((await db.search({ where: { "tags[]": { contains: "reuse-check" } } })).count).toBe(2);
     await db.close();
   });
 

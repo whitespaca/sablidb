@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   parseJsonDocument,
@@ -15,6 +16,22 @@ import { checksum, stableJson } from "../src/storage/Checksum.js";
 import { parseWalRecord } from "../src/storage/WalStore.js";
 import { parseSegmentMetadata } from "../src/validation/SegmentMetadataValidation.js";
 import { BloomFilter } from "../src/bloom/bloom-filter.js";
+
+async function collectTypeScriptFiles(root: string): Promise<readonly string[]> {
+  const entries = await readdir(root, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await collectTypeScriptFiles(path));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".ts")) {
+      files.push(path);
+    }
+  }
+  return files;
+}
 
 describe("TypeSea validation boundaries", () => {
   it("accepts valid JSON documents", () => {
@@ -150,6 +167,20 @@ describe("TypeSea validation boundaries", () => {
   });
 
   it("rejects malformed WAL records through the compiled guard", () => {
+    expect(parseWalRecord({
+      format: "sabli-wal-record",
+      version: 1,
+      sequence: 1,
+      type: "update",
+      oldDocId: 1,
+      newDocId: 2,
+      document: { ok: true }
+    })).toMatchObject({
+      type: "update",
+      oldDocId: 1,
+      newDocId: 2,
+      document: { ok: true }
+    });
     expect(() => parseWalRecord({
       format: "sabli-wal-record",
       version: 1,
@@ -173,6 +204,14 @@ describe("TypeSea validation boundaries", () => {
       docId: 1,
       document: { ok: true },
       extra: true
+    })).toThrow(SabliRecoveryError);
+    expect(() => parseWalRecord({
+      format: "sabli-wal-record",
+      version: 1,
+      sequence: 1,
+      type: "update",
+      docId: 2,
+      document: { ok: true }
     })).toThrow(SabliRecoveryError);
     expect(() => parseWalRecord({
       format: "sabli-wal-record",
@@ -228,11 +267,7 @@ describe("TypeSea validation boundaries", () => {
   });
 
   it("does not use unsafe or unchecked TypeSea validation modes", async () => {
-    const files = [
-      "src/validation/schemas.ts",
-      "src/validation/DatabaseOptionsValidation.ts",
-      "src/validation/SegmentMetadataValidation.ts"
-    ];
+    const files = await collectTypeScriptFiles("src");
     const source = (await Promise.all(files.map((file) => readFile(file, "utf8")))).join("\n");
     expect(source).not.toContain('mode: "unsafe"');
     expect(source).not.toContain('mode: "unchecked"');

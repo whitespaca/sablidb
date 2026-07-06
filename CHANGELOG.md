@@ -3,6 +3,8 @@
 ## 1.2.2 - TypeSea v0.4.0 Validation Contract Hardening
 
 - Upgraded TypeSea to v0.4.0 and hardened SABLI validation wrappers around public input and persisted storage metadata.
+- Replaced update recovery logging with one atomic update WAL record containing `oldDocId`, `newDocId`, and the replacement document.
+- Prevented immutable segment writes from overwriting existing segment directories.
 - Added hostile-input tests for getter-backed objects, prototype-pollution-looking keys, symbol and non-enumerable properties, sparse arrays, cyclic values, and invalid JSON values.
 - Tightened document, query, WAL, manifest, segment metadata, and persisted index metadata validation with stricter object schemas where compatibility allows.
 - Kept raw TypeSea diagnostics out of SABLI's public API by wrapping validation failures as SABLI domain errors.

@@ -145,14 +145,27 @@ export const DatabaseManifestInputGuard: Guard<DatabaseManifestInput> = compile(
 );
 
 /**
- * Raw WAL insert or update record before identifier branding.
+ * Raw WAL insert record before identifier branding.
  */
-export interface WalWriteRecordInput {
+export interface WalInsertRecordInput {
   readonly format: "sabli-wal-record";
   readonly version: 1;
   readonly sequence: number;
-  readonly type: "insert" | "update";
+  readonly type: "insert";
   readonly docId: number;
+  readonly document: JsonObject;
+}
+
+/**
+ * Raw atomic WAL update record before identifier branding.
+ */
+export interface WalUpdateRecordInput {
+  readonly format: "sabli-wal-record";
+  readonly version: 1;
+  readonly sequence: number;
+  readonly type: "update";
+  readonly oldDocId: number;
+  readonly newDocId: number;
   readonly document: JsonObject;
 }
 
@@ -170,7 +183,7 @@ export interface WalDeleteRecordInput {
 /**
  * Raw WAL record loaded from disk.
  */
-export type WalRecordInput = WalWriteRecordInput | WalDeleteRecordInput;
+export type WalRecordInput = WalInsertRecordInput | WalUpdateRecordInput | WalDeleteRecordInput;
 
 /**
  * TypeSea guard for WAL record payloads.
@@ -190,7 +203,8 @@ export const WalRecordInputGuard: Guard<WalRecordInput> = compile(
       version: t.literal(1),
       sequence: t.number.int().gte(1),
       type: t.literal("update"),
-      docId: t.number.int().gte(1),
+      oldDocId: t.number.int().gte(1),
+      newDocId: t.number.int().gte(1),
       document: JsonObjectGuard
     }),
     t.strictObject({

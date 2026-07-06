@@ -261,7 +261,7 @@ Validation failures are wrapped in SABLI error classes such as `SabliValidationE
 
 SABLI is a Node.js 22+ library. Its TypeSea validators may be compiled at module startup in Node.js; CSP-restricted browser runtimes are not a supported SABLI execution target.
 
-Inserted documents must be JSON-compatible plain objects at the root. Nested arrays and `null` values are allowed, but primitive root values, `undefined`, `NaN`, `Infinity`, `-Infinity`, functions, symbols, bigint values, sparse arrays, cyclic values, and accessor-backed properties are rejected. Values such as `Date`, `Map`, and `Set` must be serialized before insertion.
+Inserted documents must be JSON-compatible plain objects at the root. Nested arrays and `null` values are allowed, but non-plain root documents, primitive root values, `undefined`, `NaN`, `Infinity`, `-Infinity`, functions, symbols, bigint values, sparse arrays, cyclic values, symbol keys, and accessor-backed properties are rejected. Values such as `Date`, `Map`, and `Set` must be serialized before insertion.
 
 Search uses indexes and Bloom filters only to generate candidates. Every candidate is still checked against the raw JSON document with exact final verification before it is returned.
 
