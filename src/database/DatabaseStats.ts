@@ -19,6 +19,14 @@ export interface SabliDatabaseStats {
   readonly nextDocId: DocId;
   /** Number of immutable disk segments referenced by the active manifest. */
   readonly immutableSegmentCount: number;
+  /** Number of immutable segments whose complete required file sets were validated. */
+  readonly validatedImmutableSegmentCount: number;
+  /** Current immutable segment format version, or null when no immutable segment is loaded. */
+  readonly immutableSegmentFormatVersion: number | null;
+  /** Number of delete bitmap entries loaded from validated immutable segments. */
+  readonly loadedDeleteBitmapEntryCount: number;
+  /** Number of exact physical document identifiers loaded from immutable segment offset tables. */
+  readonly exactSegmentDocumentIdCount: number;
   /** WAL generation used for new writes. */
   readonly activeWalGeneration: number;
   /** Highest WAL sequence already represented by durable immutable storage. */

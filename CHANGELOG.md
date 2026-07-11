@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1 - Segment Integrity And Sparse Candidate Hardening
+
+- Made current-format `delete.bitmap` loading fail with controlled SABLI domain errors when the file is missing, unreadable, malformed, unsupported, or contains invalid document identifiers instead of silently treating corruption as an empty bitmap.
+- Added deterministic validation of the complete required immutable-segment file set before a segment becomes queryable.
+- Replaced min/max range enumeration with exact physical document-identifier candidates for sparse immutable segments while preserving delete filtering and posting-cache correctness.
+- Added sparse query, reopen, compaction, cache, required-file, and delete bitmap corruption coverage.
+- Updated README release, diagnostics, validation, performance, and limitation wording for version 1.3.1 consistency.
+
 ## 1.3.0 - Benchmark-Driven Query Performance And Posting Optimization
 
 - Added adaptive posting list backends with compact small postings and sorted-array postings with merge-based set operations.

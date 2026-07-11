@@ -204,6 +204,42 @@ describe("SabliDatabase persistence", () => {
     await db.close();
   });
 
+  it("posting cache uses a bounded LRU policy", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true, postingCache: { maxEntries: 1 } });
+    await db.insert({ user: { name: "lru" }, tags: ["lru"], status: "one" });
+    await db.flush();
+    await db.search({ where: { path: "tags[]", contains: "lru" } });
+    const afterFirst = await db.stats();
+    expect(afterFirst.postingCacheMisses).toBe(1);
+    expect(afterFirst.postingCacheSize).toBe(1);
+    await db.search({ where: { path: "status", eq: "one" } });
+    const afterSecond = await db.stats();
+    expect(afterSecond.postingCacheMisses).toBe(2);
+    expect(afterSecond.postingCacheSize).toBe(1);
+    await db.search({ where: { path: "tags[]", contains: "lru" } });
+    const afterEvictedLookup = await db.stats();
+    expect(afterEvictedLookup.postingCacheMisses).toBe(3);
+    expect(afterEvictedLookup.postingCacheHits).toBe(0);
+    await db.close();
+  });
+
+  it("posting cache entries are scoped per immutable segment", async () => {
+    const path = await tempDbPath();
+    const db = await SabliDatabase.open({ path, createIfMissing: true, memSegmentMaxDocuments: 1, postingCache: { maxEntries: 4 } });
+    await db.insert({ user: { name: "segment-a" }, tags: ["shared-cache"] });
+    await db.insert({ user: { name: "segment-b" }, tags: ["shared-cache"] });
+    expect((await db.stats()).immutableSegmentCount).toBe(2);
+    await db.search({ where: { path: "tags[]", contains: "shared-cache" } });
+    const afterMiss = await db.stats();
+    expect(afterMiss.postingCacheMisses).toBe(2);
+    expect(afterMiss.postingCacheSize).toBe(2);
+    await db.search({ where: { path: "tags[]", contains: "shared-cache" } });
+    const afterHit = await db.stats();
+    expect(afterHit.postingCacheHits).toBe(2);
+    await db.close();
+  });
+
   it("searches both memory and disk segments", async () => {
     const path = await tempDbPath();
     const db = await SabliDatabase.open({ path, createIfMissing: true });
@@ -639,19 +675,14 @@ describe("SabliDatabase persistence", () => {
     await reopened.close();
   });
 
-  it("returns equivalent query results across memory flush reopen and compaction", async () => {
+  it("returns equivalent query results across memory flush reopen update delete cache and compaction", async () => {
     const path = await tempDbPath();
-    const seed = async (db: SabliDatabase): Promise<void> => {
-      const first = await db.insert({ user: { name: "kim", age: 31 }, tags: ["backend", "typescript"], status: "old" });
-      await db.insert({ user: { name: "lee", age: 25 }, tags: ["frontend"], status: "keep" });
-      const third = await db.insert({ user: { name: "park", age: 40 }, tags: ["backend"], status: "delete" });
-      await db.update(first.docId, { user: { name: "kim", age: 32 }, tags: ["backend", "database"], status: "new" });
-      await db.delete(third.docId);
-    };
     const queries = [
       { where: { "user.name": { eq: "kim" } } },
       { where: { "user.age": { exists: true } } },
       { where: { "tags[]": { contains: "backend" } } },
+      { where: { path: "user.age", gte: 30 } },
+      { where: { not: { path: "status", eq: "delete" } } },
       { where: { and: [{ path: "tags[]", contains: "backend" }, { path: "status", eq: "new" }] } },
       { where: { or: [{ path: "status", eq: "new" }, { path: "status", eq: "keep" }] } }
     ] as const;
@@ -660,17 +691,27 @@ describe("SabliDatabase persistence", () => {
     );
 
     const db = await SabliDatabase.open({ path, createIfMissing: true });
-    await seed(db);
-    const memory = await readAll(db);
+    const first = await db.insert({ user: { name: "kim", age: 31 }, tags: ["backend", "typescript"], status: "old" });
+    await db.insert({ user: { name: "lee", age: 25 }, tags: ["frontend"], status: "keep" });
+    const third = await db.insert({ user: { name: "park", age: 40 }, tags: ["backend"], status: "delete" });
+    const memoryBeforeMutations = await readAll(db);
     await db.flush();
-    expect(await readAll(db)).toEqual(memory);
+    expect(await readAll(db)).toEqual(memoryBeforeMutations);
+    await db.update(first.docId, { user: { name: "kim", age: 32 }, tags: ["backend", "database"], status: "new" });
+    await db.delete(third.docId);
+    const afterMutations = await readAll(db);
+    await readAll(db);
+    expect(await readAll(db)).toEqual(afterMutations);
     await db.close();
 
     const reopened = await SabliDatabase.open({ path, createIfMissing: false });
-    expect(await readAll(reopened)).toEqual(memory);
+    expect(await readAll(reopened)).toEqual(afterMutations);
     await reopened.compact();
-    expect(await readAll(reopened)).toEqual(memory);
+    expect(await readAll(reopened)).toEqual(afterMutations);
     await reopened.close();
+    const postCompaction = await SabliDatabase.open({ path, createIfMissing: false });
+    expect(await readAll(postCompaction)).toEqual(afterMutations);
+    await postCompaction.close();
   });
 
   it("does not require obsolete WAL generations after checkpoint", async () => {

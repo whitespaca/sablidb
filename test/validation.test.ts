@@ -137,6 +137,12 @@ describe("TypeSea validation boundaries", () => {
     const optionsWithHidden = { path: "./data.sabli" };
     Object.defineProperty(optionsWithHidden, "hidden", { value: true, enumerable: false });
     expect(() => parseDatabaseOptions(optionsWithHidden)).toThrow(SabliValidationError);
+    expect(parseDatabaseOptions({ path: "./data.sabli" }).postingCacheMaxEntries).toBe(128);
+    expect(parseDatabaseOptions({ path: "./data.sabli", postingCache: { enabled: false } }).postingCacheMaxEntries).toBe(0);
+    expect(parseDatabaseOptions({ path: "./data.sabli", postingCache: { maxEntries: 4 } }).postingCacheMaxEntries).toBe(4);
+    expect(() => parseDatabaseOptions({ path: "./data.sabli", postingCache: true })).toThrow(SabliValidationError);
+    expect(() => parseDatabaseOptions({ path: "./data.sabli", postingCache: { maxEntries: -1 } })).toThrow(SabliValidationError);
+    expect(() => parseDatabaseOptions({ path: "./data.sabli", postingCache: { maxEntries: 1.5 } })).toThrow(SabliValidationError);
   });
 
   it("wraps malformed persisted metadata as corruption errors", () => {

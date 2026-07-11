@@ -80,8 +80,13 @@ export class SegmentWriter {
       const bloom = new BloomFilter(this.#bloomOptions);
       const paths = new Set<string>();
       const values = new Set<string>();
+      let minDocId = 0;
+      let maxDocId = 0;
 
       for (const { docId, document } of snapshot.documents) {
+        const numericDocId = Number(docId);
+        minDocId = minDocId === 0 ? numericDocId : Math.min(minDocId, numericDocId);
+        maxDocId = Math.max(maxDocId, numericDocId);
         for (const entry of extractEntries(document)) {
           paths.add(entry.path);
           values.add(JSON.stringify(entry.value));
@@ -112,14 +117,13 @@ export class SegmentWriter {
       await writeFile(join(tempPath, "postings.idx"), JSON.stringify(postings));
       await writeFile(join(tempPath, "bloom.bin"), JSON.stringify(bloom.serialize()));
       await writeFile(join(tempPath, "delete.bitmap"), JSON.stringify({ format: "sabli-delete-bitmap", version: 1, deleted: [] }));
-      const docIds = snapshot.documents.map(({ docId }) => Number(docId));
       const metadataPayload = {
         format: "sabli-segment" as const,
         version: 1 as const,
         segmentId,
         docCount: snapshot.documents.length,
-        minDocId: docIds.length === 0 ? 0 : Math.min(...docIds),
-        maxDocId: docIds.length === 0 ? 0 : Math.max(...docIds),
+        minDocId,
+        maxDocId,
         createdAt: new Date().toISOString(),
         bloom: bloom.serialize()
       };

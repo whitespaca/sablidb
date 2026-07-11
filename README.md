@@ -7,7 +7,7 @@
 
 SABLI is an ESModule-only TypeScript library for indexing and searching unordered schema-less JSON documents. SABLI stands for Segmented Adaptive Bloom-LSM Inverted Index.
 
-Version 1.2 provides a correctness-first embedded database with a memory write buffer, append-only WAL, immutable disk segments, delete bitmaps, manual compaction, WAL checkpointing, advisory Bloom pruning, adaptive posting abstractions, and exact final verification.
+Version 1.3.1 provides a correctness-first embedded database with a memory write buffer, append-only WAL, immutable disk segments, strict segment integrity checks, delete bitmaps, manual compaction, WAL checkpointing, advisory Bloom pruning, adaptive posting abstractions, exact sparse document candidates, bounded posting caching, and exact final verification.
 
 ## Installation
 
@@ -199,7 +199,7 @@ const next = await db.update(first.docId, {
 console.log(next.docId);
 ```
 
-Search never returns deleted documents or superseded old versions. Disk segments use versioned `delete.bitmap` files to filter tombstoned identifiers before raw documents are fetched.
+Search never returns deleted documents or superseded old versions. Disk segments use versioned `delete.bitmap` files to filter tombstoned identifiers before raw documents are fetched. Current-format immutable segments require valid delete bitmap visibility metadata; missing, unreadable, or malformed metadata causes a controlled corruption failure instead of being ignored.
 
 ## Manual Compaction
 
@@ -209,9 +209,9 @@ Compaction rewrites visible documents from immutable segments into a new immutab
 await db.compact();
 ```
 
-The v1.2 compaction policy is deliberately simple and deterministic: when `compact()` is called, SABLI flushes the current memory segment, reads all visible documents from all immutable segments, writes one compacted replacement segment, rotates to a new WAL generation, and removes unreferenced old segment directories after the manifest swap succeeds.
+The deterministic compaction policy introduced in v1.2 remains deliberately simple: when `compact()` is called, SABLI flushes the current memory segment, reads all visible documents from all immutable segments, writes one compacted replacement segment, rotates to a new WAL generation, and removes unreferenced old segment directories after the manifest swap succeeds.
 
-Compaction removes deleted documents and superseded old update versions from future compacted segments. It is manual in this milestone; no background or automatic compaction is started by the library.
+Compaction removes deleted documents and superseded old update versions from future compacted segments. It remains manual in version 1.3.1; no background or automatic compaction is started by the library.
 
 ## Diagnostics
 
@@ -223,7 +223,9 @@ const stats = await db.stats();
 console.dir(stats, { depth: null });
 ```
 
-The result includes the database path, open or closed state, manifest version, next document identifier, immutable segment count, active WAL generation, checkpoint sequence, approximate visible and deleted document counts, memory segment document count, derived immutable posting counts, posting cache counters, and whether compaction can be called on the current handle.
+The result includes the database path, open or closed state, manifest version, next document identifier, immutable segment count, active WAL generation, checkpoint sequence, approximate visible and deleted document counts, memory segment document count, derived immutable posting-key and posting-row counts, bounded posting-cache size, capacity, hit, and miss counters, and whether compaction can be called on the current handle.
+
+Version 1.3.1 also reports low-cost immutable-segment integrity diagnostics: `validatedImmutableSegmentCount`, `immutableSegmentFormatVersion` (`null` when no immutable segments are loaded), `loadedDeleteBitmapEntryCount`, and `exactSegmentDocumentIdCount`. These fields summarize state already validated while opening segments and do not expose mutable collections or require a full-database scan on each `stats()` call.
 
 ## Performance Notes
 
@@ -238,6 +240,8 @@ const db = await SabliDatabase.open({
   postingCache: { enabled: false }
 });
 ```
+
+Complement-based and unselective immutable-segment queries use exact physical document identifiers from the validated, versioned `docs.offset` table. Sparse identifier gaps are not enumerated as candidates, and deleted identifiers are filtered after the raw all-document posting is retrieved.
 
 Exact final verification remains part of every search result path. Posting lists, Bloom filters, and the cache only reduce candidate work; SABLI still reads and verifies raw JSON documents before returning matches.
 
@@ -271,7 +275,9 @@ Supported initial operators include `eq`, `neq`, `exists`, `contains`, `gt`, `gt
 
 ## Validation Behavior
 
-SABLI uses TypeSea v0.4.0-compatible runtime validation. Public input is validated with safe TypeSea semantics, and WAL records, manifests, segment metadata, checkpoint-related manifest fields, document offset tables, delete bitmaps, posting indexes, and Bloom metadata are validated when loaded.
+SABLI uses TypeSea v0.4.0-compatible runtime validation. Public input is validated with safe TypeSea semantics, and WAL records, manifests, segment metadata, checkpoint-related manifest fields, document offset tables, delete bitmaps, posting indexes, and Bloom metadata are validated when loaded. Every required current-format immutable-segment artifact is checked before the segment becomes queryable; missing or invalid artifacts fail with a controlled SABLI domain error.
+
+The `path.dict` and `value.dict` files are required and validated on open because they are part of the current segment format, but they are currently reserved and advisory to query execution. They do not determine document visibility. The `delete.bitmap` file is visibility-critical and is never ignored or substituted with an empty bitmap after a load failure.
 
 Validation failures are wrapped in SABLI error classes such as `SabliValidationError`, `SabliRecoveryError`, and `SabliCorruptionError`; raw TypeSea diagnostics are not part of the public API. SABLI does not use TypeSea unsafe or unchecked validation modes for public or persisted input.
 
@@ -337,7 +343,7 @@ Inserts, deletes, and updates are appended to the active WAL generation before t
 
 ## Durability And Recovery
 
-The default durability mode is `strict`, which asks Node.js to flush WAL appends before acknowledging writes. On startup, SABLI reads `CURRENT`, validates the active manifest, opens immutable segments, loads delete bitmaps, identifies the active WAL generation, and replays valid WAL records newer than the manifest checkpoint.
+The default durability mode is `strict`, which asks Node.js to flush WAL appends before acknowledging writes. On startup, SABLI reads `CURRENT`, validates the active manifest, validates each immutable segment's required file set and persisted metadata, loads delete bitmaps, identifies the active WAL generation, and replays valid WAL records newer than the manifest checkpoint.
 
 Partial trailing WAL records are handled deterministically by stopping at the last valid record. Checksum mismatches are treated as controlled recovery errors.
 
@@ -360,7 +366,7 @@ Benchmark results depend on hardware, filesystem behavior, Node.js version, dura
 
 ## Current Limitations
 
-This release includes manual compaction, WAL generation checkpointing, adaptive posting lists, and a bounded immutable-segment posting cache. Automatic background compaction, advanced compaction selection, compressed posting encodings, and advanced scope-aware array `elemMatch` semantics remain future work.
+Version 1.3.1 includes manual compaction, WAL generation checkpointing, adaptive posting lists, exact sparse immutable-segment candidates, a bounded immutable-segment posting cache, and strict required-file and delete bitmap validation. Automatic background compaction, advanced compaction selection, compressed posting encodings, and advanced scope-aware array `elemMatch` semantics remain future work.
 
 ## Future Roadmap
 

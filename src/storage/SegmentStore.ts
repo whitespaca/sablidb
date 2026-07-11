@@ -1,5 +1,6 @@
 import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { SabliCorruptionError } from "../errors/index.js";
 import { ImmutableSegment } from "../segment/ImmutableSegment.js";
 import { SegmentWriter } from "../segment/SegmentWriter.js";
 import type { BloomOptions } from "../query/ast.js";
@@ -39,7 +40,17 @@ export class SegmentStore {
    * @returns Immutable segment reader.
    */
   public async open(entry: ManifestSegmentEntry): Promise<ImmutableSegment> {
-    return ImmutableSegment.open(join(this.#root, entry.path), { postingCacheMaxEntries: this.#postingCacheMaxEntries });
+    const expectedPath = `segments/seg-${String(entry.segmentId).padStart(6, "0")}`;
+    if (entry.path !== expectedPath) {
+      throw new SabliCorruptionError(
+        `Invalid immutable segment ${String(entry.segmentId)} manifest entry: expected path ${expectedPath}.`
+      );
+    }
+    return ImmutableSegment.open(join(this.#root, entry.path), {
+      postingCacheMaxEntries: this.#postingCacheMaxEntries,
+      expectedSegmentId: entry.segmentId,
+      expectedDocumentCount: entry.docCount
+    });
   }
 
   /**

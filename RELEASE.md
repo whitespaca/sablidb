@@ -15,7 +15,10 @@ Before publishing `sablidb`:
 
 4. Run `npm pack --dry-run`.
 5. Inspect the package contents from the dry run.
-6. Create a temporary ESModule consumer project and install the packed tarball.
-7. Verify the README examples in that consumer project.
-8. Verify `CHANGELOG.md` contains the release version and notes.
-9. Publish only after the tarball and consumer smoke test match the intended release.
+6. Verify `package.json` and `package-lock.json` use the intended release version.
+7. Verify the latest `CHANGELOG.md` entry matches the release version.
+8. Verify README version wording and examples match the release.
+9. Create a temporary ESModule consumer project and install the packed tarball.
+10. Verify Node.js 22 or newer in that consumer project.
+11. Verify basic insert, search, update, delete, and compact examples in that consumer project.
+12. Publish only after the tarball and consumer smoke test match the intended release.

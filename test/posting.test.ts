@@ -36,6 +36,15 @@ describe("posting lists", () => {
     expect(createPostingList([toDocId(1), toDocId(2)], { smallThreshold: 1 })).toBeInstanceOf(SortedArrayPostingList);
   });
 
+  it("checks membership on both posting implementations", () => {
+    const small = new SmallPostingList([toDocId(2), toDocId(4)]);
+    const sorted = new SortedArrayPostingList(Array.from({ length: 40 }, (_, index) => toDocId(index + 1)));
+    expect(small.has(toDocId(2))).toBe(true);
+    expect(small.has(toDocId(3))).toBe(false);
+    expect(sorted.has(toDocId(40))).toBe(true);
+    expect(sorted.has(toDocId(41))).toBe(false);
+  });
+
   it("keeps small and sorted implementations result-equivalent", () => {
     const leftSmall = new SmallPostingList([toDocId(1), toDocId(3), toDocId(5)]);
     const leftSorted = new SortedArrayPostingList([toDocId(1), toDocId(3), toDocId(5)]);

@@ -4,7 +4,7 @@ import type { BloomOptions, QueryExpression, QueryPredicate } from "../query/ast
 import { planQuery } from "../query/planner.js";
 import type { DocId, JsonObject, JsonPrimitive } from "../types/json.js";
 import { toDocId } from "../types/json.js";
-import { SortedArrayPostingList, type PostingList } from "./posting.js";
+import { createPostingList, type PostingList } from "./posting.js";
 
 function primitiveType(value: JsonPrimitive): string {
   return value === null ? "null" : typeof value;
@@ -87,7 +87,7 @@ export class MutableSegment<TDocument extends JsonObject = JsonObject> {
    * @returns Posting list of all live documents.
    */
   public allLiveDocuments(): PostingList {
-    return new SortedArrayPostingList([...this.#documents.keys()].filter((docId) => !this.#deleted.has(docId)));
+    return createPostingList([...this.#documents.keys()].filter((docId) => !this.#deleted.has(docId)));
   }
 
   /**
@@ -131,9 +131,9 @@ export class MutableSegment<TDocument extends JsonObject = JsonObject> {
 
   private postingFromSet(values: ReadonlySet<DocId> | undefined): PostingList {
     if (values === undefined) {
-      return new SortedArrayPostingList([]);
+      return createPostingList([]);
     }
-    return new SortedArrayPostingList([...values].filter((docId) => !this.#deleted.has(docId)));
+    return createPostingList([...values].filter((docId) => !this.#deleted.has(docId)));
   }
 
   private candidatesForPredicate(predicate: QueryPredicate): PostingList {
@@ -141,14 +141,14 @@ export class MutableSegment<TDocument extends JsonObject = JsonObject> {
     if (predicate.exists === true) {
       candidates = this.#bloom.mightContain(`path:${predicate.path}`)
         ? this.postingFromSet(this.#pathExists.get(predicate.path))
-        : new SortedArrayPostingList([]);
+        : createPostingList([]);
     }
     const equalityValue = "eq" in predicate ? predicate.eq : "contains" in predicate ? predicate.contains : undefined;
     if (equalityValue !== undefined) {
       const term = encodeTerm(predicate.path, equalityValue);
       const equality = this.#bloom.mightContain(`term:${term}`)
         ? this.postingFromSet(this.#termPostings.get(term))
-        : new SortedArrayPostingList([]);
+        : createPostingList([]);
       candidates = candidates === undefined ? equality : candidates.intersect(equality);
     }
     const numeric = this.numericCandidates(predicate);
@@ -169,7 +169,7 @@ export class MutableSegment<TDocument extends JsonObject = JsonObject> {
       return undefined;
     }
     const values = this.#numericValues.get(predicate.path) ?? [];
-    return new SortedArrayPostingList(
+    return createPostingList(
       values
         .filter(({ value }) => {
           if (predicate.gt !== undefined && value <= predicate.gt) {
@@ -196,18 +196,24 @@ export class MutableSegment<TDocument extends JsonObject = JsonObject> {
 
   private candidatesForExpression(expression: QueryExpression): PostingList {
     if ("and" in expression) {
-      const [first, ...rest] = expression.and;
-      if (first === undefined) {
-        return new SortedArrayPostingList([]);
+      const candidates = expression.and
+        .map((child) => this.candidatesForExpression(child))
+        .sort((left, right) => left.size - right.size);
+      const [first, ...rest] = candidates;
+      if (first === undefined || first.size === 0) {
+        return createPostingList([]);
       }
-      let acc = this.candidatesForExpression(first);
+      let acc = first;
       for (const child of rest) {
-        acc = acc.intersect(this.candidatesForExpression(child));
+        acc = acc.intersect(child);
+        if (acc.size === 0) {
+          return acc;
+        }
       }
       return acc;
     }
     if ("or" in expression) {
-      let acc: PostingList = new SortedArrayPostingList([]);
+      let acc: PostingList = createPostingList([]);
       for (const child of expression.or) {
         acc = acc.union(this.candidatesForExpression(child));
       }

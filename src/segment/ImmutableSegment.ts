@@ -1,23 +1,21 @@
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BloomFilter } from "../bloom/bloom-filter.js";
 import { DocumentBlockReader } from "../storage/DocumentBlockStore.js";
 import { writeFileAtomic } from "../storage/AtomicFile.js";
 import type { DocId, JsonObject } from "../types/json.js";
 import { toDocId } from "../types/json.js";
-import { parseSegmentMetadata } from "../validation/SegmentMetadataValidation.js";
 import { createPostingList, type PostingList } from "../indexes/posting.js";
 import type { QueryExpression, QueryPredicate } from "../query/ast.js";
 import { encodeTermKey } from "./MemSegment.js";
 import type { SegmentMetadata } from "./SegmentMetadata.js";
 import { PostingCache, type PostingCacheStats } from "./PostingCache.js";
+import type { DeleteBitmapFileInput, PostingIndexFileInput } from "../validation/schemas.js";
+import type { OffsetTableFile } from "../storage/OffsetTable.js";
 import {
-  DeleteBitmapFileGuard,
-  OffsetTableFileGuard,
-  PostingIndexFileGuard,
-  type PostingIndexFileInput
-} from "../validation/schemas.js";
-import { assertValid } from "../validation/assertValid.js";
+  validateSegmentFileSet,
+  type SegmentFileValidationOptions,
+  type ValidatedSegmentFileSet
+} from "./SegmentFileValidation.js";
 
 type PostingIndexFile = PostingIndexFileInput;
 
@@ -35,12 +33,6 @@ export interface ImmutableSegmentPostingStats {
   readonly termPostingCount: number;
 }
 
-interface DeleteBitmapFile {
-  readonly format: "sabli-delete-bitmap";
-  readonly version: 1;
-  readonly deleted: readonly number[];
-}
-
 /**
  * Immutable disk-backed segment reader.
  */
@@ -50,27 +42,37 @@ export class ImmutableSegment {
   readonly #bloom: BloomFilter;
   readonly #postingCache: PostingCache;
   readonly #deleted = new Set<number>();
-  #postings: PostingIndexFile | undefined;
+  readonly #offsetTable: OffsetTableFile;
+  readonly #postingIndex: PostingIndexFile;
+  readonly #allDocumentIds: PostingList;
   #documents: DocumentBlockReader | undefined;
 
-  private constructor(root: string, metadata: SegmentMetadata, postingCacheMaxEntries: number) {
+  private constructor(root: string, files: ValidatedSegmentFileSet, postingCacheMaxEntries: number) {
     this.#root = root;
-    this.#metadata = metadata;
-    this.#bloom = BloomFilter.deserialize(metadata.bloom);
+    this.#metadata = files.metadata;
+    this.#bloom = BloomFilter.deserialize(files.metadata.bloom);
     this.#postingCache = new PostingCache(postingCacheMaxEntries);
+    this.#offsetTable = files.offsetTable;
+    this.#postingIndex = files.postingIndex;
+    this.#allDocumentIds = createPostingList(files.offsetTable.offsets.map(({ docId }) => toDocId(docId)));
+    for (const docId of files.deleteBitmap.deleted) {
+      this.#deleted.add(docId);
+    }
   }
 
   /**
    * Opens an immutable segment from disk.
    *
    * @param root - Segment directory path.
+   * @param options - Posting cache and optional manifest consistency expectations.
    * @returns Open segment reader.
    */
-  public static async open(root: string, options: { readonly postingCacheMaxEntries?: number } = {}): Promise<ImmutableSegment> {
-    const metadata = parseSegmentMetadata(JSON.parse(await readFile(join(root, "segment.meta.json"), "utf8")));
-    const segment = new ImmutableSegment(root, metadata, options.postingCacheMaxEntries ?? 128);
-    await segment.loadDeleteBitmap();
-    return segment;
+  public static async open(
+    root: string,
+    options: SegmentFileValidationOptions & { readonly postingCacheMaxEntries?: number } = {}
+  ): Promise<ImmutableSegment> {
+    const files = await validateSegmentFileSet(root, options);
+    return new ImmutableSegment(root, files, options.postingCacheMaxEntries ?? 128);
   }
 
   /**
@@ -95,6 +97,13 @@ export class ImmutableSegment {
   }
 
   /**
+   * Number of exact physical document identifiers loaded from the validated offset table.
+   */
+  public get exactDocumentIdCount(): number {
+    return this.#allDocumentIds.size;
+  }
+
+  /**
    * Approximate number of visible documents in this segment.
    */
   public get liveDocumentCount(): number {
@@ -113,14 +122,14 @@ export class ImmutableSegment {
    *
    * @returns Posting statistics.
    */
-  public async postingStats(): Promise<ImmutableSegmentPostingStats> {
-    const postings = await this.postings();
-    return {
+  public postingStats(): Promise<ImmutableSegmentPostingStats> {
+    const postings = this.postings();
+    return Promise.resolve({
       pathKeyCount: postings.pathExists.length,
       pathPostingCount: postings.pathExists.reduce((sum, row) => sum + row[1].length, 0),
       termKeyCount: postings.termPostings.length,
       termPostingCount: postings.termPostings.reduce((sum, row) => sum + row[1].length, 0)
-    };
+    });
   }
 
   /**
@@ -143,7 +152,7 @@ export class ImmutableSegment {
     if (this.isDeleted(docId)) {
       return undefined;
     }
-    const reader = await this.documentReader();
+    const reader = this.documentReader();
     return reader.read(docId);
   }
 
@@ -153,7 +162,7 @@ export class ImmutableSegment {
    * @returns Visible documents paired with their document identifiers.
    */
   public async readLiveDocuments(): Promise<readonly { readonly docId: DocId; readonly document: JsonObject }[]> {
-    const reader = await this.documentReader();
+    const reader = this.documentReader();
     const documents = await reader.readAll();
     return documents.filter(({ docId }) => !this.isDeleted(docId));
   }
@@ -164,7 +173,7 @@ export class ImmutableSegment {
    * @param docId - Document identifier to tombstone.
    */
   public async markDeleted(docId: DocId): Promise<void> {
-    if (Number(docId) < this.#metadata.minDocId || Number(docId) > this.#metadata.maxDocId) {
+    if (!this.#allDocumentIds.has(docId)) {
       return;
     }
     const document = await this.getDocumentIgnoringDelete(docId);
@@ -185,17 +194,15 @@ export class ImmutableSegment {
     }
   }
 
-  private async documentReader(): Promise<DocumentBlockReader> {
+  private documentReader(): DocumentBlockReader {
     if (this.#documents === undefined) {
-      const parsed: unknown = JSON.parse(await readFile(join(this.#root, "docs.offset"), "utf8"));
-      const table = assertValid(OffsetTableFileGuard, parsed, "corruption", "Invalid document offset table: malformed metadata.");
-      this.#documents = new DocumentBlockReader(join(this.#root, "docs.bin"), table);
+      this.#documents = new DocumentBlockReader(join(this.#root, "docs.bin"), this.#offsetTable);
     }
     return this.#documents;
   }
 
   private async getDocumentIgnoringDelete(docId: DocId): Promise<JsonObject | undefined> {
-    const reader = await this.documentReader();
+    const reader = this.documentReader();
     return reader.read(docId);
   }
 
@@ -203,24 +210,8 @@ export class ImmutableSegment {
     return this.#deleted.has(Number(docId));
   }
 
-  private async loadDeleteBitmap(): Promise<void> {
-    try {
-      const parsed: unknown = JSON.parse(await readFile(join(this.#root, "delete.bitmap"), "utf8"));
-      if (!DeleteBitmapFileGuard.is(parsed)) {
-        return;
-      }
-      for (const docId of parsed.deleted) {
-        if (Number.isInteger(docId) && docId >= 1) {
-          this.#deleted.add(docId);
-        }
-      }
-    } catch {
-      return;
-    }
-  }
-
   private async writeDeleteBitmap(): Promise<void> {
-    const payload: DeleteBitmapFile = {
+    const payload: DeleteBitmapFileInput = {
       format: "sabli-delete-bitmap",
       version: 1,
       deleted: [...this.#deleted].sort((left, right) => left - right)
@@ -228,22 +219,12 @@ export class ImmutableSegment {
     await writeFileAtomic(join(this.#root, "delete.bitmap"), `${JSON.stringify(payload)}\n`);
   }
 
-  private async postings(): Promise<PostingIndexFile> {
-    if (this.#postings === undefined) {
-      const parsed: unknown = JSON.parse(await readFile(join(this.#root, "postings.idx"), "utf8"));
-      this.#postings = assertValid(PostingIndexFileGuard, parsed, "corruption", "Invalid posting index: malformed metadata.");
-    }
-    return this.#postings;
+  private postings(): PostingIndexFile {
+    return this.#postingIndex;
   }
 
   private allDocuments(): PostingList {
-    const ids: DocId[] = [];
-    for (let value = this.#metadata.minDocId; value <= this.#metadata.maxDocId; value += 1) {
-      if (!this.#deleted.has(value)) {
-        ids.push(toDocId(value));
-      }
-    }
-    return createPostingList(ids);
+    return this.filterDeleted(this.#allDocumentIds);
   }
 
   private filterDeleted(posting: PostingList): PostingList {
@@ -261,8 +242,8 @@ export class ImmutableSegment {
     return this.filterDeleted(raw);
   }
 
-  private async candidatesForPredicate(predicate: QueryPredicate): Promise<PostingList> {
-    const postings = await this.postings();
+  private candidatesForPredicate(predicate: QueryPredicate): PostingList {
+    const postings = this.postings();
     let candidates: PostingList | undefined;
     if (predicate.exists === true) {
       candidates = this.#bloom.mightContain(`path:${predicate.path}`)
@@ -295,7 +276,7 @@ export class ImmutableSegment {
       return undefined;
     }
     const rows = postings.numericValues.find(([path]) => path === predicate.path)?.[1] ?? [];
-    return createPostingList(
+    return this.filterDeleted(createPostingList(
       rows
         .filter(({ value }) => {
           if (predicate.gt !== undefined && value <= predicate.gt) {
@@ -317,11 +298,14 @@ export class ImmutableSegment {
           return true;
         })
         .map(({ docId }) => toDocId(docId))
-    );
+    ));
   }
 
   private async candidatesForExpression(expression: QueryExpression): Promise<PostingList> {
     if ("and" in expression) {
+      // Segment-local cardinality ordering is applied after each child has been
+      // resolved to a posting list, because disk and delete-bitmap state are
+      // segment-specific and not visible to the generic query planner.
       const candidates = await Promise.all(expression.and.map((child) => this.candidatesForExpression(child)));
       candidates.sort((left, right) => left.size - right.size);
       const [first, ...rest] = candidates;

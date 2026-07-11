@@ -1,5 +1,6 @@
 import { open, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
+import { SabliCorruptionError, SabliStorageError } from "../errors/index.js";
 import type { JsonObject } from "../types/json.js";
 import { toDocId, type DocId } from "../types/json.js";
 import { JsonObjectGuard } from "../validation/schemas.js";
@@ -49,7 +50,6 @@ export class DocumentBlockWriter {
 export class DocumentBlockReader {
   readonly #path: string;
   readonly #offsets = new Map<number, DocumentOffset>();
-  #handle: FileHandle | undefined;
 
   /**
    * Creates a document block reader.
@@ -75,11 +75,12 @@ export class DocumentBlockReader {
     if (offset === undefined) {
       return undefined;
     }
-    this.#handle ??= await open(this.#path, "r");
-    const buffer = Buffer.alloc(offset.length);
-    await this.#handle.read(buffer, 0, offset.length, offset.offset);
-    const parsed: unknown = JSON.parse(buffer.toString("utf8"));
-    return assertValid(JsonObjectGuard, parsed, "corruption", "Invalid document block: document payload must be a JSON object.");
+    const handle = await this.openHandle();
+    try {
+      return await this.readOffset(handle, offset);
+    } finally {
+      await this.closeHandle(handle);
+    }
   }
 
   /**
@@ -89,11 +90,14 @@ export class DocumentBlockReader {
    */
   public async readAll(): Promise<readonly { readonly docId: DocId; readonly document: JsonObject }[]> {
     const out: { readonly docId: DocId; readonly document: JsonObject }[] = [];
-    for (const offset of this.#offsets.values()) {
-      const document = await this.read(toDocId(offset.docId));
-      if (document !== undefined) {
+    const handle = await this.openHandle();
+    try {
+      for (const offset of this.#offsets.values()) {
+        const document = await this.readOffset(handle, offset);
         out.push({ docId: toDocId(offset.docId), document });
       }
+    } finally {
+      await this.closeHandle(handle);
     }
     return out;
   }
@@ -102,9 +106,47 @@ export class DocumentBlockReader {
    * Closes the underlying file handle.
    */
   public async close(): Promise<void> {
-    if (this.#handle !== undefined) {
-      await this.#handle.close();
-      this.#handle = undefined;
+    await Promise.resolve();
+  }
+
+  private async openHandle(): Promise<FileHandle> {
+    try {
+      return await open(this.#path, "r");
+    } catch (error) {
+      throw new SabliStorageError(`Failed to read immutable segment artifact docs.bin at ${this.#path}.`, { cause: error });
     }
+  }
+
+  private async closeHandle(handle: FileHandle): Promise<void> {
+    try {
+      await handle.close();
+    } catch (error) {
+      throw new SabliStorageError(`Failed to close immutable segment artifact docs.bin at ${this.#path}.`, { cause: error });
+    }
+  }
+
+  private async readOffset(handle: FileHandle, offset: DocumentOffset): Promise<JsonObject> {
+    const buffer = Buffer.alloc(offset.length);
+    let bytesRead: number;
+    try {
+      ({ bytesRead } = await handle.read(buffer, 0, offset.length, offset.offset));
+    } catch (error) {
+      throw new SabliStorageError(`Failed to read immutable segment artifact docs.bin at ${this.#path}.`, { cause: error });
+    }
+    if (bytesRead !== offset.length) {
+      throw new SabliCorruptionError(`Invalid immutable segment artifact docs.bin at ${this.#path}: document payload is truncated.`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(buffer.toString("utf8"));
+    } catch (error) {
+      throw new SabliCorruptionError(`Invalid immutable segment artifact docs.bin at ${this.#path}: document payload is not valid JSON.`, { cause: error });
+    }
+    return assertValid(
+      JsonObjectGuard,
+      parsed,
+      "corruption",
+      `Invalid immutable segment artifact docs.bin at ${this.#path}: document payload must be a JSON object.`
+    );
   }
 }

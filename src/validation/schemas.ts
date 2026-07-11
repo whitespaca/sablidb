@@ -275,6 +275,48 @@ export const DeleteBitmapFileGuard: Guard<DeleteBitmapFileInput> = compile(
 );
 
 /**
+ * Raw persisted path dictionary loaded from an immutable segment directory.
+ */
+export interface PathDictionaryFileInput {
+  readonly format: "sabli-path-dict";
+  readonly version: 1;
+  readonly paths: readonly string[];
+}
+
+/**
+ * TypeSea guard for immutable segment path dictionaries.
+ */
+export const PathDictionaryFileGuard: Guard<PathDictionaryFileInput> = compile(
+  t.strictObject({
+    format: t.literal("sabli-path-dict"),
+    version: t.literal(1),
+    paths: t.array(t.string)
+  }),
+  { name: "isPathDictionaryFile" }
+);
+
+/**
+ * Raw persisted value dictionary loaded from an immutable segment directory.
+ */
+export interface ValueDictionaryFileInput {
+  readonly format: "sabli-value-dict";
+  readonly version: 1;
+  readonly values: readonly string[];
+}
+
+/**
+ * TypeSea guard for immutable segment value dictionaries.
+ */
+export const ValueDictionaryFileGuard: Guard<ValueDictionaryFileInput> = compile(
+  t.strictObject({
+    format: t.literal("sabli-value-dict"),
+    version: t.literal(1),
+    values: t.array(t.string)
+  }),
+  { name: "isValueDictionaryFile" }
+);
+
+/**
  * Raw persisted posting index entry for numeric predicates.
  */
 export interface NumericPostingRowInput {
