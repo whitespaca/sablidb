@@ -7,7 +7,7 @@
 
 SABLI is an ESModule-only TypeScript library for indexing and searching unordered schema-less JSON documents. SABLI stands for Segmented Adaptive Bloom-LSM Inverted Index.
 
-Version 1.3.1 provides a correctness-first embedded database with a memory write buffer, append-only WAL, immutable disk segments, strict segment integrity checks, delete bitmaps, manual compaction, WAL checkpointing, advisory Bloom pruning, adaptive posting abstractions, exact sparse document candidates, bounded posting caching, and exact final verification.
+Version 1.4.0 adds scope-aware array `elemMatch` queries to the correctness-first embedded database. Predicates inside `elemMatch` are intersected by both document and concrete array-element identity, while ordinary queries keep their existing document-level semantics. The release retains the append-only WAL, immutable segments, strict segment integrity checks, manual compaction, bounded posting cache, and exact raw-document verification.
 
 ## Installation
 
@@ -51,6 +51,57 @@ console.dir(results.documents, { depth: null });
 
 await db.close();
 ```
+
+## Same-Element Array Queries
+
+Use `elemMatch` when every child predicate must hold within one concrete element of an array:
+
+```ts
+const results = await db.search({
+  where: {
+    path: "orders[]",
+    elemMatch: {
+      and: [
+        { path: "id", eq: "A2" },
+        { path: "price", gt: 10_000 }
+      ]
+    }
+  }
+});
+```
+
+Child paths are relative to the selected array element. Nested object paths are supported:
+
+```ts
+await db.search({
+  where: {
+    path: "orders[]",
+    elemMatch: {
+      and: [
+        { path: "shipping.address.city", eq: "Seoul" },
+        { path: "total", gte: 20_000 }
+      ]
+    }
+  }
+});
+```
+
+Given this document:
+
+```json
+{
+  "orders": [
+    { "id": "A1", "price": 8000 },
+    { "id": "A2", "price": 12000 }
+  ]
+}
+```
+
+an `elemMatch` requiring `id == "A1"` and `price > 10000` does not match. The two facts occur in different element scopes. Requiring `id == "A2"` with the same price predicate does match.
+
+The target path must end in `[]`. A missing target, a non-array target, or an empty array does not match. Primitive and `null` array elements can be addressed with the special relative child path `$`; positive object-relative predicates do not match them, while `exists: false` and `neq` keep ordinary missing-path semantics. Ordinary primitive-array membership continues to use `contains`. Nested `elemMatch` and `not` inside `elemMatch` are rejected in v1.4. Relative paths containing `[]` may inspect nested arrays with ordinary existential leaf semantics, but cannot express a second common inner scope until nested `elemMatch` is supported.
+
+See [`examples/elem-match.ts`](./examples/elem-match.ts) for a complete persistent database example.
 
 Plain `console.log(results.documents)` may show nested values as `[Object]` or `[Array]`:
 
@@ -211,7 +262,7 @@ await db.compact();
 
 The deterministic compaction policy introduced in v1.2 remains deliberately simple: when `compact()` is called, SABLI flushes the current memory segment, reads all visible documents from all immutable segments, writes one compacted replacement segment, rotates to a new WAL generation, and removes unreferenced old segment directories after the manifest swap succeeds.
 
-Compaction removes deleted documents and superseded old update versions from future compacted segments. It remains manual in version 1.3.1; no background or automatic compaction is started by the library.
+Compaction removes deleted documents and superseded old update versions from future compacted segments. It remains manual in version 1.4.0; no background or automatic compaction is started by the library.
 
 ## Diagnostics
 
@@ -225,7 +276,7 @@ console.dir(stats, { depth: null });
 
 The result includes the database path, open or closed state, manifest version, next document identifier, immutable segment count, active WAL generation, checkpoint sequence, approximate visible and deleted document counts, memory segment document count, derived immutable posting-key and posting-row counts, bounded posting-cache size, capacity, hit, and miss counters, and whether compaction can be called on the current handle.
 
-Version 1.3.1 also reports low-cost immutable-segment integrity diagnostics: `validatedImmutableSegmentCount`, `immutableSegmentFormatVersion` (`null` when no immutable segments are loaded), `loadedDeleteBitmapEntryCount`, and `exactSegmentDocumentIdCount`. These fields summarize state already validated while opening segments and do not expose mutable collections or require a full-database scan on each `stats()` call.
+Version 1.4.0 also reports low-cost immutable-segment integrity and scoped-index diagnostics. These include `validatedImmutableSegmentCount`, `immutableSegmentFormatVersion`, the sorted `immutableSegmentFormatVersions` in use, `legacyElemMatchFallbackSegmentCount`, `loadedDeleteBitmapEntryCount`, `exactSegmentDocumentIdCount`, scoped array/path/term posting key and row counts, and scoped cache size, hit, and miss counters. The values summarize state already validated or loaded while opening segments and do not expose mutable collections or require a full-database scan on each `stats()` call.
 
 ## Performance Notes
 
@@ -242,6 +293,10 @@ const db = await SabliDatabase.open({
 ```
 
 Complement-based and unselective immutable-segment queries use exact physical document identifiers from the validated, versioned `docs.offset` table. Sparse identifier gaps are not enumerated as candidates, and deleted identifiers are filtered after the raw all-document posting is retrieved.
+
+`elemMatch` uses a separate correctness-first scoped posting index. Scoped entries are sorted unique `(Document ID, Scope ID)` pairs, so an AND intersects the concrete element identity as well as the document identity. Equality and path-existence terms use scoped postings, and numeric ranges use inspectable scoped numeric rows. Scoped and ordinary cache keys are distinct. Bloom filters only prune individual scoped terms; independent Bloom hits never prove a same-element conjunction.
+
+Version-1 immutable segments written by SABLI v1.3.1 remain readable. They have no scoped posting file, so `elemMatch` uses conservative visible document candidates and exact raw verification. New flushes write segment metadata version 2 with `scoped-postings.idx`, and compaction naturally upgrades visible legacy documents into the current format.
 
 Exact final verification remains part of every search result path. Posting lists, Bloom filters, and the cache only reduce candidate work; SABLI still reads and verifies raw JSON documents before returning matches.
 
@@ -273,9 +328,11 @@ await db.search({
 
 Supported initial operators include `eq`, `neq`, `exists`, `contains`, `gt`, `gte`, `lt`, `lte`, `between`, `and`, `or`, and `not`.
 
+The canonical same-array-element form is `{ path: "array[]", elemMatch: expression }`. The earlier reserved placeholder form `{ elemMatch: { path, where } }` is accepted as compatibility input and normalized to the canonical representation.
+
 ## Validation Behavior
 
-SABLI uses TypeSea v0.4.0-compatible runtime validation. Public input is validated with safe TypeSea semantics, and WAL records, manifests, segment metadata, checkpoint-related manifest fields, document offset tables, delete bitmaps, posting indexes, and Bloom metadata are validated when loaded. Every required current-format immutable-segment artifact is checked before the segment becomes queryable; missing or invalid artifacts fail with a controlled SABLI domain error.
+SABLI uses TypeSea v0.4.0-compatible runtime validation. Public input is validated with safe TypeSea semantics, and WAL records, manifests, segment metadata, checkpoint-related manifest fields, document offset tables, delete bitmaps, ordinary posting indexes, scoped posting indexes, and Bloom metadata are validated when loaded. Every required current-format immutable-segment artifact is checked before the segment becomes queryable; missing or invalid artifacts fail with a controlled SABLI domain error.
 
 The `path.dict` and `value.dict` files are required and validated on open because they are part of the current segment format, but they are currently reserved and advisory to query execution. They do not determine document visibility. The `delete.bitmap` file is visibility-critical and is never ignored or substituted with an empty bitmap after a load failure.
 
@@ -335,9 +392,12 @@ database.sabli/
       path.dict
       value.dict
       postings.idx
+      scoped-postings.idx
       bloom.bin
       delete.bitmap
 ```
+
+`scoped-postings.idx` is mandatory for segment metadata version 2. A version-2 segment with a missing, malformed, unsupported, unsorted, duplicate, or non-physical scoped posting fails with `SabliCorruptionError`; it is never silently opened as a legacy segment.
 
 Inserts, deletes, and updates are appended to the active WAL generation before they are acknowledged in strict durability mode. `flush()` writes the current memory segment to an immutable disk segment, checkpoints the WAL sequence, rotates to a new WAL generation, and updates the manifest atomically.
 
@@ -360,18 +420,18 @@ npm run bench:reopen -- --count 1000
 npm run bench:compaction -- --count 1000
 ```
 
-The scripts generate synthetic JSON documents, use temporary database directories by default, and print elapsed time in English. Pass `--keep` to keep the generated database directory for inspection, or `--path ./bench.sabli` to use a specific database path. Search benchmarks report equality, contains, AND, and repeated cached query latency.
+The scripts generate synthetic JSON documents, use temporary database directories by default, and print elapsed time in English. Pass `--keep` to keep the generated database directory for inspection, or `--path ./bench.sabli` to use a specific database path. Search benchmarks report total query time, average latency, p50, p95, and p99 for ordinary equality, contains, AND, repeated cached search, and scoped `elemMatch` equality/range cases with cold and warm cache coverage.
 
 Benchmark results depend on hardware, filesystem behavior, Node.js version, durability mode, and active operating system caches. Normal tests only verify benchmark scripts run and do not enforce strict performance thresholds.
 
 ## Current Limitations
 
-Version 1.3.1 includes manual compaction, WAL generation checkpointing, adaptive posting lists, exact sparse immutable-segment candidates, a bounded immutable-segment posting cache, and strict required-file and delete bitmap validation. Automatic background compaction, advanced compaction selection, compressed posting encodings, and advanced scope-aware array `elemMatch` semantics remain future work.
+Version 1.4.0 includes scope-aware same-element AND/OR matching for one target array scope, legacy segment fallback, scoped posting persistence and caching, manual compaction, WAL generation checkpointing, adaptive document postings, and strict required-file validation. Nested `elemMatch`, child-scope `not`, automatic background compaction, advanced compaction selection, compressed posting encodings, and arbitrary cross-array joins are not implemented.
 
 ## Future Roadmap
 
 - Automatic compaction scheduling and richer compaction selection.
 - More compact posting encodings.
 - Larger-scale lazy loading and cache controls.
-- Richer scoped array matching.
+- Nested scoped-array matching and carefully defined scoped negation.
 - Richer storage diagnostics and recovery tooling.

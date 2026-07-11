@@ -354,3 +354,109 @@ export const PostingIndexFileGuard: Guard<PostingIndexFileInput> = compile(
   }),
   { name: "isPostingIndexFile" }
 );
+
+/**
+ * Persisted document and local array-element scope identity.
+ */
+export type ScopedPostingPairInput = readonly [number, number];
+
+/**
+ * Persisted universe of concrete element scopes for one normalized array path.
+ */
+export interface ScopedScopePostingInput {
+  readonly arrayPath: string;
+  readonly postings: readonly ScopedPostingPairInput[];
+}
+
+/**
+ * Persisted scoped path-existence posting row.
+ */
+export interface ScopedPathPostingInput {
+  readonly arrayPath: string;
+  readonly relativePath: string;
+  readonly postings: readonly ScopedPostingPairInput[];
+}
+
+/**
+ * Persisted scoped equality posting row.
+ */
+export interface ScopedTermPostingInput extends ScopedPathPostingInput {
+  readonly valueType: "null" | "boolean" | "number" | "string";
+  readonly value: JsonPrimitive;
+}
+
+/**
+ * Persisted numeric value within one concrete element scope.
+ */
+export interface ScopedNumericValueInput {
+  readonly docId: number;
+  readonly scopeId: number;
+  readonly value: number;
+}
+
+/**
+ * Persisted scoped numeric posting row.
+ */
+export interface ScopedNumericPostingInput {
+  readonly arrayPath: string;
+  readonly relativePath: string;
+  readonly values: readonly ScopedNumericValueInput[];
+}
+
+/**
+ * Raw persisted scoped posting index file.
+ */
+export interface ScopedPostingIndexFileInput {
+  readonly format: "sabli-scoped-postings";
+  readonly version: 1;
+  readonly scopes: readonly ScopedScopePostingInput[];
+  readonly pathExists: readonly ScopedPathPostingInput[];
+  readonly termPostings: readonly ScopedTermPostingInput[];
+  readonly numericValues: readonly ScopedNumericPostingInput[];
+}
+
+const ScopedPostingPairGuard = t.tuple([
+  t.number.int().gte(1),
+  t.number.int().gte(1)
+]);
+
+const ScopedPostingPathFields = {
+  arrayPath: t.string,
+  relativePath: t.string,
+  postings: t.array(ScopedPostingPairGuard)
+};
+
+/**
+ * TypeSea guard for immutable segment scoped posting indexes.
+ */
+export const ScopedPostingIndexFileGuard: Guard<ScopedPostingIndexFileInput> = compile(
+  t.strictObject({
+    format: t.literal("sabli-scoped-postings"),
+    version: t.literal(1),
+    scopes: t.array(t.strictObject({
+      arrayPath: t.string,
+      postings: t.array(ScopedPostingPairGuard)
+    })),
+    pathExists: t.array(t.strictObject(ScopedPostingPathFields)),
+    termPostings: t.array(t.strictObject({
+      ...ScopedPostingPathFields,
+      valueType: t.union(
+        t.literal("null"),
+        t.literal("boolean"),
+        t.literal("number"),
+        t.literal("string")
+      ),
+      value: JsonPrimitiveGuard
+    })),
+    numericValues: t.array(t.strictObject({
+      arrayPath: t.string,
+      relativePath: t.string,
+      values: t.array(t.strictObject({
+        docId: t.number.int().gte(1),
+        scopeId: t.number.int().gte(1),
+        value: t.number
+      }))
+    }))
+  }),
+  { name: "isScopedPostingIndexFile" }
+);

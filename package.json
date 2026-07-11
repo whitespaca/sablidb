@@ -1,6 +1,6 @@
 {
   "name": "sablidb",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "Segmented Adaptive Bloom-LSM Inverted Index for JSON documents.",
   "type": "module",
   "private": false,

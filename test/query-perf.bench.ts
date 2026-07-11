@@ -12,7 +12,7 @@ const complexQuery = {
           { path: "user.name", eq: "Alice" },
           {
             elemMatch: {
-              path: "user.history",
+              path: "user.history[]",
               where: { path: "status", eq: "active" }
             }
           }

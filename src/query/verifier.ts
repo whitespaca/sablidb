@@ -1,6 +1,11 @@
-import { normalizeJsonPath } from "../core/path.js";
+import { parseJsonPath, type PathToken } from "../core/path.js";
 import type { JsonObject, JsonPrimitive, JsonValue } from "../types/json.js";
-import type { Query, QueryExpression, QueryPredicate } from "./ast.js";
+import type {
+  ElemMatchExpression,
+  Query,
+  QueryExpression,
+  QueryPredicate
+} from "./ast.js";
 
 function isPrimitive(value: JsonValue): value is JsonPrimitive {
   return value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string";
@@ -10,39 +15,54 @@ function isJsonArray(value: JsonValue): value is readonly JsonValue[] {
   return Array.isArray(value);
 }
 
-function escapeKey(key: string): string {
-  return key.replaceAll("\\", "\\\\").replaceAll(".", "\\.").replaceAll("[", "\\[").replaceAll("]", "\\]").replaceAll("$", "\\$");
+function isJsonObject(value: JsonValue): value is JsonObject {
+  return !isPrimitive(value) && !isJsonArray(value);
 }
 
-function flatten(value: JsonValue, path: string): readonly { readonly path: string; readonly value: JsonPrimitive }[] {
-  if (isPrimitive(value)) {
-    return [{ path: normalizeJsonPath(path), value }];
-  }
-  const out: { readonly path: string; readonly value: JsonPrimitive }[] = [];
-  if (isJsonArray(value)) {
-    for (const child of value) {
-      out.push(...flatten(child, `${path}[]`));
+function pathTokens(path: string): readonly PathToken[] {
+  return path === "$" ? [{ kind: "root" }] : parseJsonPath(path);
+}
+
+function valuesAtPath(root: JsonValue, path: string): readonly JsonValue[] {
+  let values: readonly JsonValue[] = [root];
+  for (const token of pathTokens(path).slice(1)) {
+    const next: JsonValue[] = [];
+    if (token.kind === "property") {
+      for (const value of values) {
+        if (!isJsonObject(value)) {
+          continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(value, token.key);
+        if (descriptor !== undefined && descriptor.enumerable && "value" in descriptor) {
+          const child: unknown = descriptor.value;
+          next.push(child as JsonValue);
+        }
+      }
+    } else if (token.kind === "array") {
+      for (const value of values) {
+        if (isJsonArray(value)) {
+          next.push(...value);
+        }
+      }
     }
-    return out;
+    values = next;
+    if (values.length === 0) {
+      return values;
+    }
   }
-  for (const [key, child] of Object.entries(value)) {
-    const escaped = escapeKey(key);
-    out.push(...flatten(child, path === "$" ? `$.${escaped}` : `${path}.${escaped}`));
-  }
-  return out;
+  return values;
 }
 
-function valuesAt(document: JsonObject, path: string): readonly JsonPrimitive[] {
-  const normalized = normalizeJsonPath(path);
-  return flatten(document, "$").filter((entry) => entry.path === normalized).map((entry) => entry.value);
+function primitiveValuesAt(root: JsonValue, path: string): readonly JsonPrimitive[] {
+  return valuesAtPath(root, path).filter(isPrimitive);
 }
 
 function compareNumeric(values: readonly JsonPrimitive[], predicate: (value: number) => boolean): boolean {
   return values.some((value) => typeof value === "number" && predicate(value));
 }
 
-function verifyPredicate(document: JsonObject, predicate: QueryPredicate): boolean {
-  const values = valuesAt(document, predicate.path);
+function verifyPredicate(root: JsonValue, predicate: QueryPredicate): boolean {
+  const values = primitiveValuesAt(root, predicate.path);
   if (predicate.exists !== undefined && (predicate.exists ? values.length === 0 : values.length > 0)) {
     return false;
   }
@@ -88,21 +108,39 @@ function verifyPredicate(document: JsonObject, predicate: QueryPredicate): boole
   return true;
 }
 
-function verifyExpression(document: JsonObject, expression: QueryExpression): boolean {
+interface ResolvedElemMatchExpression {
+  readonly path: string;
+  readonly expression: QueryExpression;
+}
+
+function resolveElemMatchExpression(expression: ElemMatchExpression): ResolvedElemMatchExpression {
+  if ("path" in expression) {
+    return { path: expression.path, expression: expression.elemMatch };
+  }
+  return { path: expression.elemMatch.path, expression: expression.elemMatch.where };
+}
+
+function arrayElementsAt(root: JsonValue, path: string): readonly JsonValue[] {
+  const tokens = pathTokens(path);
+  return tokens.at(-1)?.kind === "array" ? valuesAtPath(root, path) : [];
+}
+
+function verifyExpression(root: JsonValue, expression: QueryExpression): boolean {
   if ("and" in expression) {
-    return expression.and.every((child) => verifyExpression(document, child));
+    return expression.and.every((child) => verifyExpression(root, child));
   }
   if ("or" in expression) {
-    return expression.or.some((child) => verifyExpression(document, child));
+    return expression.or.some((child) => verifyExpression(root, child));
   }
   if ("not" in expression) {
-    return !verifyExpression(document, expression.not);
+    return !verifyExpression(root, expression.not);
   }
   if ("elemMatch" in expression) {
-    // TODO: Implement same-array-element scoped verification when scoped indexes are added.
-    return verifyExpression(document, expression.elemMatch.where);
+    const elemMatch = resolveElemMatchExpression(expression);
+    return arrayElementsAt(root, elemMatch.path)
+      .some((element) => verifyExpression(element, elemMatch.expression));
   }
-  return verifyPredicate(document, expression);
+  return verifyPredicate(root, expression);
 }
 
 /**
@@ -111,7 +149,9 @@ function verifyExpression(document: JsonObject, expression: QueryExpression): bo
  * @param document - The JSON document to verify.
  * @param query - The normalized SABLI query.
  * @returns True when the document satisfies the query.
- * @remarks This function is the correctness oracle for optimized search.
+ * @remarks This function is the correctness oracle for optimized search. An
+ * `elemMatch` child expression is always evaluated against one concrete array
+ * element and never combines values from separate elements.
  */
 export function verifyDocument(document: JsonObject, query: Query): boolean {
   return verifyExpression(document, query.where);

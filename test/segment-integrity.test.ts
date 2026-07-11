@@ -15,7 +15,9 @@ import {
   type QueryExpression
 } from "../src/index.js";
 import { SegmentWriter } from "../src/segment/SegmentWriter.js";
-import { OffsetTableFileGuard } from "../src/validation/schemas.js";
+import { checksum, stableJson } from "../src/storage/Checksum.js";
+import { parseSegmentMetadata } from "../src/validation/SegmentMetadataValidation.js";
+import { OffsetTableFileGuard, ScopedPostingIndexFileGuard } from "../src/validation/schemas.js";
 
 const roots: string[] = [];
 
@@ -63,6 +65,30 @@ async function openFailure(databasePath: string): Promise<unknown> {
   } catch (error: unknown) {
     return error;
   }
+}
+
+async function markActiveSegmentLegacy(databasePath: string, removeScopedPostings = true): Promise<string> {
+  const segmentPath = await activeSegmentPath(databasePath);
+  const metadataInput: unknown = JSON.parse(await readFile(join(segmentPath, "segment.meta.json"), "utf8"));
+  const metadata = parseSegmentMetadata(metadataInput);
+  const payload = {
+    format: "sabli-segment" as const,
+    version: 1 as const,
+    segmentId: metadata.segmentId,
+    docCount: metadata.docCount,
+    minDocId: metadata.minDocId,
+    maxDocId: metadata.maxDocId,
+    createdAt: metadata.createdAt,
+    bloom: metadata.bloom
+  };
+  await writeFile(join(segmentPath, "segment.meta.json"), JSON.stringify({
+    ...payload,
+    checksum: checksum(stableJson(payload))
+  }));
+  if (removeScopedPostings) {
+    await rm(join(segmentPath, "scoped-postings.idx"));
+  }
+  return segmentPath;
 }
 
 function expectCorruption(error: unknown, segmentPath: string, artifact: string): void {
@@ -201,6 +227,7 @@ const requiredSegmentArtifacts = [
   "docs.bin",
   "docs.offset",
   "postings.idx",
+  "scoped-postings.idx",
   "bloom.bin",
   "delete.bitmap",
   "path.dict",
@@ -211,6 +238,7 @@ const structuredSegmentArtifacts = [
   "segment.meta.json",
   "docs.offset",
   "postings.idx",
+  "scoped-postings.idx",
   "bloom.bin",
   "path.dict",
   "value.dict"
@@ -264,6 +292,194 @@ describe("immutable segment file-set validation", () => {
     differentBloom.add("different");
     await writeFile(join(segmentPath, "bloom.bin"), JSON.stringify(differentBloom.serialize()));
     expectCorruption(await openFailure(databasePath), segmentPath, "bloom.bin");
+  });
+});
+
+describe("scoped posting persistence compatibility", () => {
+  const sameElementQuery = {
+    where: {
+      path: "orders[]",
+      elemMatch: {
+        and: [
+          { path: "id", eq: "A1" },
+          { path: "price", gt: 10_000 }
+        ]
+      }
+    }
+  } as const satisfies Query;
+
+  const notAnyA1Query = {
+    where: {
+      not: {
+        path: "orders[]",
+        elemMatch: { path: "id", eq: "A1" }
+      }
+    }
+  } as const satisfies Query;
+
+  it("opens legacy segments safely and upgrades them through compaction", async () => {
+    const databasePath = await temporaryDatabasePath();
+    const created = await SabliDatabase.open({ path: databasePath, createIfMissing: true });
+    await created.insert({
+      label: "cross-element",
+      orders: [
+        { id: "A1", price: 8_000 },
+        { id: "A2", price: 12_000 }
+      ]
+    });
+    await created.insert({ label: "same-element", orders: [{ id: "A1", price: 12_000 }] });
+    await created.insert({ label: "no-a1", orders: [{ id: "B1", price: 20_000 }] });
+    await created.flush();
+    await created.close();
+
+    await markActiveSegmentLegacy(databasePath);
+    const legacy = await SabliDatabase.open({
+      path: databasePath,
+      createIfMissing: false,
+      postingCache: { maxEntries: 8 }
+    });
+    expect(await queryDocumentIds(legacy, { where: { path: "label", eq: "same-element" } })).toEqual([2]);
+    expect(await queryDocumentIds(legacy, sameElementQuery)).toEqual([2]);
+    expect(await queryDocumentIds(legacy, notAnyA1Query)).toEqual([3]);
+    await expect(legacy.stats()).resolves.toMatchObject({
+      immutableSegmentFormatVersion: 1,
+      immutableSegmentFormatVersions: [1],
+      legacyElemMatchFallbackSegmentCount: 1,
+      immutableScopedArrayPostingCount: 0,
+      immutableScopedPathPostingCount: 0,
+      immutableScopedTermPostingCount: 0
+    });
+
+    await legacy.compact();
+    expect(await queryDocumentIds(legacy, sameElementQuery)).toEqual([2]);
+    expect(await queryDocumentIds(legacy, notAnyA1Query)).toEqual([3]);
+    expect(await queryDocumentIds(legacy, sameElementQuery)).toEqual([2]);
+    const upgradedStats = await legacy.stats();
+    expect(upgradedStats).toMatchObject({
+      immutableSegmentFormatVersion: 2,
+      immutableSegmentFormatVersions: [2],
+      legacyElemMatchFallbackSegmentCount: 0
+    });
+    expect(upgradedStats.immutableScopedArrayPostingCount).toBeGreaterThan(0);
+    expect(upgradedStats.immutableScopedPathPostingCount).toBeGreaterThan(0);
+    expect(upgradedStats.immutableScopedTermPostingCount).toBeGreaterThan(0);
+    expect(upgradedStats.scopedPostingCacheHits).toBeGreaterThan(0);
+    expect(upgradedStats.postingCacheSize).toBeLessThanOrEqual(upgradedStats.postingCacheMaxEntries);
+    await legacy.close();
+
+    const upgradedPath = await activeSegmentPath(databasePath);
+    const scopedInput: unknown = JSON.parse(await readFile(join(upgradedPath, "scoped-postings.idx"), "utf8"));
+    expect(ScopedPostingIndexFileGuard.is(scopedInput)).toBe(true);
+    const reopened = await SabliDatabase.open({ path: databasePath, createIfMissing: false });
+    expect(await queryDocumentIds(reopened, sameElementQuery)).toEqual([2]);
+    await expect(reopened.stats()).resolves.toMatchObject({
+      immutableSegmentFormatVersions: [2],
+      legacyElemMatchFallbackSegmentCount: 0
+    });
+    await reopened.close();
+  });
+
+  it("keeps scoped cache behavior bounded and correct when disabled", async () => {
+    const databasePath = await temporaryDatabasePath();
+    const database = await SabliDatabase.open({
+      path: databasePath,
+      createIfMissing: true,
+      postingCache: { enabled: false }
+    });
+    await database.insert({ label: "same-element", orders: [{ id: "A1", price: 12_000 }] });
+    await database.flush();
+    expect(await queryDocumentIds(database, sameElementQuery)).toEqual([1]);
+    expect(await queryDocumentIds(database, sameElementQuery)).toEqual([1]);
+    await expect(database.stats()).resolves.toMatchObject({
+      postingCacheMaxEntries: 0,
+      postingCacheSize: 0,
+      scopedPostingCacheSize: 0,
+      scopedPostingCacheHits: 0
+    });
+    await database.close();
+  });
+
+  it("compacts mixed legacy and current segments into one current scoped segment", async () => {
+    const databasePath = await temporaryDatabasePath();
+    const initial = await SabliDatabase.open({ path: databasePath, createIfMissing: true });
+    await initial.insert({ label: "legacy-match", orders: [{ id: "A1", price: 12_000 }] });
+    await initial.flush();
+    await initial.close();
+    await markActiveSegmentLegacy(databasePath);
+
+    const mixed = await SabliDatabase.open({ path: databasePath, createIfMissing: false });
+    await mixed.insert({ label: "current-match", orders: [{ id: "A1", price: 13_000 }] });
+    await mixed.flush();
+    await expect(mixed.stats()).resolves.toMatchObject({
+      immutableSegmentCount: 2,
+      immutableSegmentFormatVersions: [1, 2],
+      legacyElemMatchFallbackSegmentCount: 1
+    });
+    expect(await queryDocumentIds(mixed, sameElementQuery)).toEqual([1, 2]);
+
+    await mixed.compact();
+    expect(await queryDocumentIds(mixed, sameElementQuery)).toEqual([1, 2]);
+    await expect(mixed.stats()).resolves.toMatchObject({
+      immutableSegmentCount: 1,
+      immutableSegmentFormatVersions: [2],
+      legacyElemMatchFallbackSegmentCount: 0
+    });
+    await mixed.close();
+
+    const reopened = await SabliDatabase.open({ path: databasePath, createIfMissing: false });
+    expect(await queryDocumentIds(reopened, sameElementQuery)).toEqual([1, 2]);
+    await reopened.close();
+  });
+
+  it("rejects a scoped posting artifact paired with legacy metadata", async () => {
+    const { databasePath } = await createClosedSegmentDatabase();
+    const segmentPath = await markActiveSegmentLegacy(databasePath, false);
+    expectCorruption(await openFailure(databasePath), segmentPath, "scoped-postings.idx");
+  });
+
+  it("rejects scoped postings that reference non-physical documents", async () => {
+    const { databasePath, segmentPath } = await createClosedSegmentDatabase();
+    await writeFile(join(segmentPath, "scoped-postings.idx"), JSON.stringify({
+      format: "sabli-scoped-postings",
+      version: 1,
+      scopes: [{ arrayPath: "$.orders[]", postings: [[99, 1]] }],
+      pathExists: [],
+      termPostings: [],
+      numericValues: []
+    }));
+    expectCorruption(await openFailure(databasePath), segmentPath, "scoped-postings.idx");
+  });
+
+  it("rejects unsorted or duplicate scoped posting pairs", async () => {
+    const { databasePath, segmentPath } = await createClosedSegmentDatabase();
+    await writeFile(join(segmentPath, "scoped-postings.idx"), JSON.stringify({
+      format: "sabli-scoped-postings",
+      version: 1,
+      scopes: [{ arrayPath: "$.orders[]", postings: [[2, 1], [1, 1], [1, 1]] }],
+      pathExists: [],
+      termPostings: [],
+      numericValues: []
+    }));
+    expectCorruption(await openFailure(databasePath), segmentPath, "scoped-postings.idx");
+  });
+
+  it("rejects scoped term postings outside the declared scope universe", async () => {
+    const { databasePath, segmentPath } = await createClosedSegmentDatabase();
+    await writeFile(join(segmentPath, "scoped-postings.idx"), JSON.stringify({
+      format: "sabli-scoped-postings",
+      version: 1,
+      scopes: [],
+      pathExists: [],
+      termPostings: [{
+        arrayPath: "$.orders[]",
+        relativePath: "$.id",
+        valueType: "string",
+        value: "A1",
+        postings: [[1, 1]]
+      }],
+      numericValues: []
+    }));
+    expectCorruption(await openFailure(databasePath), segmentPath, "scoped-postings.idx");
   });
 });
 
@@ -330,7 +546,7 @@ describe("delete bitmap corruption handling", () => {
     await expect(populated.stats()).resolves.toMatchObject({
       approximateDeletedDocumentCount: 1,
       validatedImmutableSegmentCount: 1,
-      immutableSegmentFormatVersion: 1,
+      immutableSegmentFormatVersion: 2,
       loadedDeleteBitmapEntryCount: 1,
       exactSegmentDocumentIdCount: 3
     });

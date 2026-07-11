@@ -8,7 +8,7 @@ import { assertValid } from "./assertValid.js";
 
 export const SegmentMetadataGuard = compile(t.strictObject({
   format: t.literal("sabli-segment"),
-  version: t.literal(1),
+  version: t.union(t.literal(1), t.literal(2)),
   segmentId: t.number.int().gte(0),
   docCount: t.number.int().gte(0),
   minDocId: t.number.int().gte(0),
@@ -48,7 +48,7 @@ export function parseSegmentMetadata(input: unknown): SegmentMetadata {
   }
   return {
     format: "sabli-segment",
-    version: 1,
+    version: record.version,
     segmentId: toSegmentId(record.segmentId),
     docCount: record.docCount,
     minDocId: record.minDocId,

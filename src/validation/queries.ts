@@ -1,8 +1,20 @@
-import { normalizeJsonPath } from "../core/path.js";
+import { normalizeJsonPath, parseJsonPath } from "../core/path.js";
 import { SabliValidationError } from "../errors/index.js";
-import type { Query, QueryExpression, QueryPredicate, QueryValue } from "../query/ast.js";
+import type {
+  ElemMatchQueryExpression,
+  Query,
+  QueryExpression,
+  QueryPredicate,
+  QueryValue
+} from "../query/ast.js";
 import { assertValid } from "./assertValid.js";
 import { QueryInputGuard } from "./schemas.js";
+
+type ExpressionMode = "document" | "element";
+
+interface QueryParseState {
+  readonly active: WeakSet<object>;
+}
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -47,6 +59,48 @@ function assertOnlyKeys(input: Readonly<Record<string, unknown>>, allowed: Reado
   return keys;
 }
 
+function withActiveObject<T>(input: object, state: QueryParseState, parse: () => T): T {
+  if (state.active.has(input)) {
+    throw new SabliValidationError("Invalid query: cyclic query objects are not supported.");
+  }
+  state.active.add(input);
+  try {
+    return parse();
+  } finally {
+    state.active.delete(input);
+  }
+}
+
+function denseArrayValues(input: readonly unknown[], context: string): readonly unknown[] {
+  const indexed = new Map<number, unknown>();
+  for (const key of Reflect.ownKeys(input)) {
+    if (typeof key === "symbol") {
+      throw new SabliValidationError(`Invalid query: ${context} must not include symbol keys.`);
+    }
+    if (key === "length") {
+      continue;
+    }
+    if (!/^(?:0|[1-9]\d*)$/.test(key)) {
+      throw new SabliValidationError(`Invalid query: ${context} must not include custom array properties.`);
+    }
+    const index = Number(key);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= input.length) {
+      throw new SabliValidationError(`Invalid query: ${context} contains an invalid array index.`);
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new SabliValidationError(`Invalid query: ${context} entries must be enumerable data properties.`);
+    }
+    indexed.set(index, descriptor.value);
+  }
+  if (indexed.size !== input.length) {
+    throw new SabliValidationError(`Invalid query: ${context} must not contain sparse array entries.`);
+  }
+  return [...indexed.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, value]) => value);
+}
+
 function normalizeQueryPath(path: string): string {
   try {
     return normalizeJsonPath(path);
@@ -55,26 +109,45 @@ function normalizeQueryPath(path: string): string {
   }
 }
 
-function parseExpressionArray(input: unknown, operator: "and" | "or"): readonly QueryExpression[] {
+function normalizeElemMatchTargetPath(path: string): string {
+  const normalized = normalizeQueryPath(path);
+  const tokens = parseJsonPath(normalized);
+  if (tokens[1]?.kind !== "property" || tokens.at(-1)?.kind !== "array") {
+    throw new SabliValidationError("Invalid query: elemMatch path must identify an array and end with '[]'.");
+  }
+  return normalized;
+}
+
+function normalizeElementPath(path: string): string {
+  if (path === "$") {
+    return path;
+  }
+  if (path.startsWith("$")) {
+    throw new SabliValidationError("Invalid query: elemMatch child paths must be relative; only '$' may address the element itself.");
+  }
+  return normalizeQueryPath(path);
+}
+
+function parseExpressionArray(
+  input: unknown,
+  operator: "and" | "or",
+  mode: ExpressionMode,
+  state: QueryParseState
+): readonly QueryExpression[] {
   if (!Array.isArray(input) || input.length === 0) {
     throw new SabliValidationError(`Invalid query: ${operator} requires a non-empty array.`);
   }
-  const expressions: QueryExpression[] = [];
-  for (let index = 0; index < input.length; index += 1) {
-    if (!Object.prototype.hasOwnProperty.call(input, index)) {
-      throw new SabliValidationError(`Invalid query: ${operator} must not contain sparse array entries.`);
+  return withActiveObject(input, state, () => {
+    const expressions: QueryExpression[] = [];
+    for (const value of denseArrayValues(input, operator)) {
+      expressions.push(parseExpression(value, mode, state));
     }
-    const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
-    if (descriptor === undefined || !("value" in descriptor)) {
-      throw new SabliValidationError(`Invalid query: ${operator} entries must be data properties.`);
-    }
-    expressions.push(parseExpression(descriptor.value));
-  }
-  return expressions;
+    return expressions;
+  });
 }
 
-function parsePredicate(path: string, input: Readonly<Record<string, unknown>>): QueryPredicate {
-  const normalizedPath = normalizeQueryPath(path);
+function parsePredicate(path: string, input: Readonly<Record<string, unknown>>, mode: ExpressionMode): QueryPredicate {
+  const normalizedPath = mode === "element" ? normalizeElementPath(path) : normalizeQueryPath(path);
   const predicate: {
     path: string;
     eq?: QueryValue;
@@ -125,11 +198,10 @@ function parsePredicate(path: string, input: Readonly<Record<string, unknown>>):
   }
   if (hasOwnKey(record, "between")) {
     const value = getOwnValue(input, "between");
-    const left = Array.isArray(value) ? Object.getOwnPropertyDescriptor(value, "0") : undefined;
-    const right = Array.isArray(value) ? Object.getOwnPropertyDescriptor(value, "1") : undefined;
-    const leftValue: unknown = left !== undefined && "value" in left ? left.value : undefined;
-    const rightValue: unknown = right !== undefined && "value" in right ? right.value : undefined;
-    if (!Array.isArray(value) || value.length !== 2 || typeof leftValue !== "number" || typeof rightValue !== "number" || !Number.isFinite(leftValue) || !Number.isFinite(rightValue) || leftValue > rightValue) {
+    const tuple = Array.isArray(value) ? denseArrayValues(value, "between") : [];
+    const leftValue = tuple[0];
+    const rightValue = tuple[1];
+    if (tuple.length !== 2 || typeof leftValue !== "number" || typeof rightValue !== "number" || !Number.isFinite(leftValue) || !Number.isFinite(rightValue) || leftValue > rightValue) {
       throw new SabliValidationError("Invalid query: between requires an ordered numeric tuple.");
     }
     predicate.between = [leftValue, rightValue];
@@ -141,61 +213,84 @@ function parsePredicate(path: string, input: Readonly<Record<string, unknown>>):
   return predicate;
 }
 
-function parseExpression(input: unknown): QueryExpression {
+function parseExpression(input: unknown, mode: ExpressionMode, state: QueryParseState): QueryExpression {
   if (!isRecord(input)) {
     throw new SabliValidationError("Invalid query: where must be an object.");
   }
-  const record = input;
-  if (hasOwnKey(record, "and")) {
-    assertOnlyKeys(record, new Set(["and"]), "expression");
-    const and = getOwnValue(record, "and");
-    return { and: parseExpressionArray(and, "and") };
-  }
-  if (hasOwnKey(record, "or")) {
-    assertOnlyKeys(record, new Set(["or"]), "expression");
-    const or = getOwnValue(record, "or");
-    return { or: parseExpressionArray(or, "or") };
-  }
-  if (hasOwnKey(record, "not")) {
-    assertOnlyKeys(record, new Set(["not"]), "expression");
-    return { not: parseExpression(getOwnValue(record, "not")) };
-  }
-  if (hasOwnKey(record, "elemMatch")) {
-    assertOnlyKeys(record, new Set(["elemMatch"]), "expression");
-    const elemMatch = getOwnValue(record, "elemMatch");
-    if (!isRecord(elemMatch)) {
-      throw new SabliValidationError("Invalid query: elemMatch requires a path and where expression.");
+  return withActiveObject(input, state, () => {
+    const record = input;
+    if (hasOwnKey(record, "and")) {
+      assertOnlyKeys(record, new Set(["and"]), "expression");
+      const and = getOwnValue(record, "and");
+      return { and: parseExpressionArray(and, "and", mode, state) };
     }
-    assertOnlyKeys(elemMatch, new Set(["path", "where"]), "elemMatch");
-    const elemMatchPath = getOwnValue(elemMatch, "path");
-    return {
-      elemMatch: {
-        path: typeof elemMatchPath === "string" ? normalizeQueryPath(elemMatchPath) : (() => {
-          throw new SabliValidationError("Invalid query: elemMatch requires a path and where expression.");
-        })(),
-        where: parseExpression(getOwnValue(elemMatch, "where"))
+    if (hasOwnKey(record, "or")) {
+      assertOnlyKeys(record, new Set(["or"]), "expression");
+      const or = getOwnValue(record, "or");
+      return { or: parseExpressionArray(or, "or", mode, state) };
+    }
+    if (hasOwnKey(record, "not")) {
+      if (mode === "element") {
+        throw new SabliValidationError("Invalid query: not is not supported inside elemMatch.");
       }
-    };
-  }
-  if (hasOwnKey(record, "path")) {
-    const path = getOwnValue(record, "path");
-    if (typeof path !== "string") {
-      throw new SabliValidationError("Invalid query: predicate path must be a string.");
+      assertOnlyKeys(record, new Set(["not"]), "expression");
+      return { not: parseExpression(getOwnValue(record, "not"), mode, state) };
     }
-    return parsePredicate(path, record);
-  }
+    if (hasOwnKey(record, "elemMatch")) {
+      if (mode === "element") {
+        throw new SabliValidationError("Invalid query: nested elemMatch expressions are not supported.");
+      }
+      if (hasOwnKey(record, "path")) {
+        assertOnlyKeys(record, new Set(["path", "elemMatch"]), "elemMatch expression");
+        const targetPath = getOwnValue(record, "path");
+        if (typeof targetPath !== "string") {
+          throw new SabliValidationError("Invalid query: elemMatch requires a string array path.");
+        }
+        return {
+          path: normalizeElemMatchTargetPath(targetPath),
+          elemMatch: parseExpression(getOwnValue(record, "elemMatch"), "element", state) as ElemMatchQueryExpression
+        };
+      }
 
-  const expressions = ownStringKeys(input, "where").map((path) => {
-    const condition = getOwnValue(input, path);
-    if (!isRecord(condition)) {
-      throw new SabliValidationError("Invalid query: field conditions must be objects.");
+      assertOnlyKeys(record, new Set(["elemMatch"]), "expression");
+      const compatibilityInput = getOwnValue(record, "elemMatch");
+      if (!isRecord(compatibilityInput)) {
+        throw new SabliValidationError("Invalid query: elemMatch requires an array path and a non-empty child expression.");
+      }
+      return withActiveObject(compatibilityInput, state, () => {
+        assertOnlyKeys(compatibilityInput, new Set(["path", "where"]), "elemMatch");
+        const targetPath = getOwnValue(compatibilityInput, "path");
+        if (typeof targetPath !== "string" || !hasOwnKey(compatibilityInput, "where")) {
+          throw new SabliValidationError("Invalid query: elemMatch requires an array path and a non-empty child expression.");
+        }
+        return {
+          path: normalizeElemMatchTargetPath(targetPath),
+          elemMatch: parseExpression(getOwnValue(compatibilityInput, "where"), "element", state) as ElemMatchQueryExpression
+        };
+      });
     }
-    return parsePredicate(path, condition);
+    if (hasOwnKey(record, "path")) {
+      const path = getOwnValue(record, "path");
+      if (typeof path !== "string") {
+        throw new SabliValidationError("Invalid query: predicate path must be a string.");
+      }
+      return parsePredicate(path, record, mode);
+    }
+
+    const expressions = ownStringKeys(input, mode === "element" ? "elemMatch expression" : "where").map((path) => {
+      const condition = getOwnValue(input, path);
+      if (!isRecord(condition)) {
+        throw new SabliValidationError("Invalid query: field conditions must be objects.");
+      }
+      return parsePredicate(path, condition, mode);
+    });
+    if (expressions.length === 0) {
+      throw new SabliValidationError(mode === "element"
+        ? "Invalid query: elemMatch expression must not be empty."
+        : "Invalid query: where must not be empty.");
+    }
+    return expressions.length === 1 ? expressions[0] as QueryExpression : { and: expressions };
   });
-  if (expressions.length === 0) {
-    throw new SabliValidationError("Invalid query: where must not be empty.");
-  }
-  return expressions.length === 1 ? expressions[0] as QueryExpression : { and: expressions };
 }
 
 /**
@@ -207,9 +302,10 @@ function parseExpression(input: unknown): QueryExpression {
  */
 export function parseQuery(input: unknown): Query {
   const object = assertValid(QueryInputGuard, input, "public", "Invalid query.");
+  const state: QueryParseState = { active: new WeakSet() };
   if (!hasOwnKey(object, "where")) {
-    return { where: parseExpression(object) };
+    return { where: parseExpression(object, "document", state) };
   }
   assertOnlyKeys(object, new Set(["where"]), "query");
-  return { where: parseExpression(getOwnValue(object, "where")) };
+  return { where: parseExpression(getOwnValue(object, "where"), "document", state) };
 }

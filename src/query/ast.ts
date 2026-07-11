@@ -56,15 +56,60 @@ export interface NotExpression {
 }
 
 /**
- * Same-array-element query semantics reserved for scoped arrays.
+ * A Boolean AND expression evaluated relative to one array element.
  */
-export interface ElemMatchExpression {
-  /** Array path that defines the element scope. */
+export interface ElemMatchAndExpression {
+  /** Relative child expressions that must all match the same element. */
+  readonly and: readonly ElemMatchQueryExpression[];
+}
+
+/**
+ * A Boolean OR expression evaluated relative to one array element.
+ */
+export interface ElemMatchOrExpression {
+  /** Relative child expressions where at least one must match the element. */
+  readonly or: readonly ElemMatchQueryExpression[];
+}
+
+/**
+ * A query expression supported inside one array-element scope.
+ *
+ * @remarks Child predicate paths are relative to the selected element. The
+ * special path `$` addresses a primitive element itself. Nested `elemMatch`
+ * and Boolean NOT are intentionally excluded from this milestone.
+ */
+export type ElemMatchQueryExpression = QueryPredicate | ElemMatchAndExpression | ElemMatchOrExpression;
+
+/**
+ * Canonical query form requiring one concrete array element to satisfy its child expression.
+ */
+export interface CanonicalElemMatchExpression {
+  /** Canonical array path that defines the element scope. */
+  readonly path: string;
+  /** Expression evaluated relative to one common array element. */
+  readonly elemMatch: ElemMatchQueryExpression;
+}
+
+/**
+ * Compatibility form published as a reserved placeholder before SABLI v1.4.
+ *
+ * @remarks Public query validation accepts this shape and normalizes it to
+ * {@link CanonicalElemMatchExpression}. New code should use the canonical form.
+ */
+export interface LegacyElemMatchExpression {
+  /** Legacy wrapper containing the array path and relative child expression. */
   readonly elemMatch: {
+    /** Array path that defines the element scope. */
     readonly path: string;
+    /** Expression evaluated relative to one common array element. */
     readonly where: QueryExpression;
   };
 }
+
+/**
+ * A same-array-element query in canonical or v1.3 compatibility form.
+ */
+export type ElemMatchExpression = CanonicalElemMatchExpression | LegacyElemMatchExpression;
 
 /**
  * A normalized SABLI query expression.

@@ -22,8 +22,13 @@ export type { PostingList, PostingListOptions } from "./indexes/posting.js";
 export type {
   AndExpression,
   BloomOptions,
+  CanonicalElemMatchExpression,
+  ElemMatchAndExpression,
   ElemMatchExpression,
+  ElemMatchOrExpression,
+  ElemMatchQueryExpression,
   InsertResult,
+  LegacyElemMatchExpression,
   NotExpression,
   OrExpression,
   Query,

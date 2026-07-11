@@ -279,6 +279,8 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
     const immutableDeleted = this.#segments.reduce((sum, segment) => sum + segment.deletedDocumentCount, 0);
     const cacheStats = this.#segments.map((segment) => segment.postingCacheStats);
     const postingStats = await Promise.all(this.#segments.map((segment) => segment.postingStats()));
+    const segmentFormatVersions = [...new Set(this.#segments.map((segment) => segment.metadata.version))]
+      .sort((left, right) => left - right);
     const memLive = this.#mem.documentCount;
     return {
       path: this.#directory.paths.root,
@@ -288,6 +290,8 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       immutableSegmentCount: this.#manifest.segments.length,
       validatedImmutableSegmentCount: this.#segments.length,
       immutableSegmentFormatVersion: this.#segments[0]?.metadata.version ?? null,
+      immutableSegmentFormatVersions: segmentFormatVersions,
+      legacyElemMatchFallbackSegmentCount: this.#segments.filter((segment) => segment.requiresElemMatchFallback).length,
       loadedDeleteBitmapEntryCount: immutableDeleted,
       exactSegmentDocumentIdCount: this.#segments.reduce((sum, segment) => sum + segment.exactDocumentIdCount, 0),
       activeWalGeneration: this.#manifest.activeWalGeneration,
@@ -299,11 +303,20 @@ export class SabliDatabase<TDocument extends JsonObject = JsonObject> {
       immutablePathPostingCount: postingStats.reduce((sum, stats) => sum + stats.pathPostingCount, 0),
       immutableTermPostingKeyCount: postingStats.reduce((sum, stats) => sum + stats.termKeyCount, 0),
       immutableTermPostingCount: postingStats.reduce((sum, stats) => sum + stats.termPostingCount, 0),
+      immutableScopedArrayPostingKeyCount: postingStats.reduce((sum, stats) => sum + stats.scopedArrayKeyCount, 0),
+      immutableScopedArrayPostingCount: postingStats.reduce((sum, stats) => sum + stats.scopedArrayPostingCount, 0),
+      immutableScopedPathPostingKeyCount: postingStats.reduce((sum, stats) => sum + stats.scopedPathKeyCount, 0),
+      immutableScopedPathPostingCount: postingStats.reduce((sum, stats) => sum + stats.scopedPathPostingCount, 0),
+      immutableScopedTermPostingKeyCount: postingStats.reduce((sum, stats) => sum + stats.scopedTermKeyCount, 0),
+      immutableScopedTermPostingCount: postingStats.reduce((sum, stats) => sum + stats.scopedTermPostingCount, 0),
       compactionAvailable: isDatabaseOpen(this.#lifecycle),
       postingCacheSize: cacheStats.reduce((sum, stats) => sum + stats.size, 0),
       postingCacheMaxEntries: cacheStats.reduce((sum, stats) => sum + stats.maxEntries, 0),
       postingCacheHits: cacheStats.reduce((sum, stats) => sum + stats.hits, 0),
-      postingCacheMisses: cacheStats.reduce((sum, stats) => sum + stats.misses, 0)
+      postingCacheMisses: cacheStats.reduce((sum, stats) => sum + stats.misses, 0),
+      scopedPostingCacheSize: cacheStats.reduce((sum, stats) => sum + stats.scopedSize, 0),
+      scopedPostingCacheHits: cacheStats.reduce((sum, stats) => sum + stats.scopedHits, 0),
+      scopedPostingCacheMisses: cacheStats.reduce((sum, stats) => sum + stats.scopedMisses, 0)
     };
   }
 

@@ -38,7 +38,21 @@ export function createBenchmarkDocument(id: number): JsonObject {
     metrics: {
       score: (id * 17) % 1000,
       shard: id % 16
-    }
+    },
+    orders: [
+      {
+        id: `order-${String(id % 250)}`,
+        status: id % 4 === 0 ? "paid" : "pending",
+        channel: id % 3 === 0 ? "store" : "web",
+        price: 1_000 + ((id * 37) % 25_000)
+      },
+      {
+        id: `alternate-${String(id)}`,
+        status: id % 5 === 0 ? "paid" : "cancelled",
+        channel: "partner",
+        price: 500 + ((id * 19) % 12_000)
+      }
+    ]
   };
 }
 

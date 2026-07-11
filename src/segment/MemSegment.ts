@@ -1,8 +1,15 @@
 import { BloomFilter } from "../bloom/bloom-filter.js";
 import { extractEntries } from "../extract/extractor.js";
+import { extractScopedEntries } from "../extract/scoped-extractor.js";
 import type { BloomOptions, QueryExpression, QueryPredicate } from "../query/ast.js";
 import type { DocId, JsonObject, JsonPrimitive } from "../types/json.js";
 import { createPostingList, type PostingList } from "../indexes/posting.js";
+import {
+  expressionContainsElemMatch,
+  isElemMatchExpression,
+  resolveElemMatchExpression,
+  ScopedIndex
+} from "../indexes/scoped-index.js";
 
 /**
  * Encodes a primitive value into the term key format used by SABLI postings.
@@ -34,6 +41,7 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
   readonly #pathExists = new Map<string, Set<DocId>>();
   readonly #termPostings = new Map<string, Set<DocId>>();
   readonly #numericValues = new Map<string, Array<{ readonly docId: DocId; readonly value: number }>>();
+  readonly #scopedIndex = new ScopedIndex();
   readonly #bloom: BloomFilter;
   #lastWalSequence = 0;
 
@@ -87,6 +95,7 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
     this.#deleted.delete(docId);
     this.#lastWalSequence = Math.max(this.#lastWalSequence, walSequence);
     const entries = extractEntries(document);
+    this.#scopedIndex.addDocument(docId, extractScopedEntries(document));
     for (const entry of entries) {
       this.addPosting(this.#pathExists, entry.path, docId);
       this.#bloom.add(`path:${entry.path}`);
@@ -159,6 +168,7 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
     this.#pathExists.clear();
     this.#termPostings.clear();
     this.#numericValues.clear();
+    this.#scopedIndex.clear();
     this.#lastWalSequence = 0;
   }
 
@@ -244,6 +254,16 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
   }
 
   private candidatesForExpression(expression: QueryExpression): PostingList {
+    if (isElemMatchExpression(expression)) {
+      const elemMatch = resolveElemMatchExpression(expression);
+      if (elemMatch === undefined) {
+        return this.allLiveDocuments();
+      }
+      return this.#scopedIndex
+        .candidates(elemMatch.arrayPath, elemMatch.expression)
+        .matchingDocumentIds()
+        .intersect(this.allLiveDocuments());
+    }
     if ("and" in expression) {
       const candidates = expression.and
         .map((child) => this.candidatesForExpression(child))
@@ -269,11 +289,10 @@ export class MemSegment<TDocument extends JsonObject = JsonObject> {
       return acc;
     }
     if ("not" in expression) {
+      if (expressionContainsElemMatch(expression.not)) {
+        return this.allLiveDocuments();
+      }
       return this.allLiveDocuments().difference(this.candidatesForExpression(expression.not));
-    }
-    if ("elemMatch" in expression) {
-      // TODO: Add scope-aware candidate planning once scoped array postings are implemented.
-      return this.candidatesForExpression(expression.elemMatch.where);
     }
     return this.candidatesForPredicate(expression);
   }

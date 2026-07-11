@@ -1,5 +1,7 @@
 import { open, readFile, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { normalizeJsonPath } from "../core/path.js";
+import { encodeScopedPathKey } from "../indexes/scoped-index.js";
 import { SabliCorruptionError, SabliStorageError } from "../errors/index.js";
 import { stableJson } from "../storage/Checksum.js";
 import type { OffsetTableFile } from "../storage/OffsetTable.js";
@@ -11,14 +13,18 @@ import {
   OffsetTableFileGuard,
   PathDictionaryFileGuard,
   PostingIndexFileGuard,
+  ScopedPostingIndexFileGuard,
   SerializedBloomFilterGuard,
   ValueDictionaryFileGuard,
   type DeleteBitmapFileInput,
-  type PostingIndexFileInput
+  type PostingIndexFileInput,
+  type ScopedPostingIndexFileInput,
+  type ScopedPostingPairInput
 } from "../validation/schemas.js";
 import type { SegmentMetadata } from "./SegmentMetadata.js";
+import { encodeScopedTermIdentity } from "./ScopedPostingIndex.js";
 
-const REQUIRED_SEGMENT_ARTIFACTS = [
+const COMMON_SEGMENT_ARTIFACTS = [
   "segment.meta.json",
   "docs.bin",
   "docs.offset",
@@ -29,7 +35,9 @@ const REQUIRED_SEGMENT_ARTIFACTS = [
   "delete.bitmap"
 ] as const;
 
-type SegmentArtifactName = (typeof REQUIRED_SEGMENT_ARTIFACTS)[number];
+const SCOPED_POSTING_ARTIFACT = "scoped-postings.idx" as const;
+
+type SegmentArtifactName = (typeof COMMON_SEGMENT_ARTIFACTS)[number] | typeof SCOPED_POSTING_ARTIFACT;
 
 /**
  * Optional manifest expectations used while validating an immutable segment.
@@ -51,6 +59,8 @@ export interface ValidatedSegmentFileSet {
   readonly offsetTable: OffsetTableFile;
   /** Validated posting index. */
   readonly postingIndex: PostingIndexFileInput;
+  /** Validated scoped posting index, absent only for legacy version-1 segments. */
+  readonly scopedPostingIndex?: ScopedPostingIndexFileInput;
   /** Validated visibility-critical delete bitmap. */
   readonly deleteBitmap: DeleteBitmapFileInput;
 }
@@ -75,8 +85,19 @@ export async function validateSegmentFileSet(
     );
   }
 
+  await requireRegularFile(root, segment, "segment.meta.json");
+  const metadataInput = await readJsonArtifact(root, segment, "segment.meta.json");
+  const metadata = validateArtifact(segment, "segment.meta.json", () => parseSegmentMetadata(metadataInput));
+  validateManifestExpectations(segment, metadata, options);
+
   let documentBlockSize = 0;
-  for (const artifact of REQUIRED_SEGMENT_ARTIFACTS) {
+  const requiredArtifacts: readonly SegmentArtifactName[] = metadata.version === 2
+    ? [...COMMON_SEGMENT_ARTIFACTS, SCOPED_POSTING_ARTIFACT]
+    : COMMON_SEGMENT_ARTIFACTS;
+  for (const artifact of requiredArtifacts) {
+    if (artifact === "segment.meta.json") {
+      continue;
+    }
     const size = await requireRegularFile(root, segment, artifact);
     if (artifact === "docs.bin") {
       documentBlockSize = size;
@@ -84,9 +105,13 @@ export async function validateSegmentFileSet(
   }
   await assertDocumentBlockReadable(root, segment);
 
-  const metadataInput = await readJsonArtifact(root, segment, "segment.meta.json");
-  const metadata = validateArtifact(segment, "segment.meta.json", () => parseSegmentMetadata(metadataInput));
-  validateManifestExpectations(segment, metadata, options);
+  if (metadata.version === 1 && await artifactExists(root, SCOPED_POSTING_ARTIFACT)) {
+    throw segmentCorruption(
+      segment,
+      SCOPED_POSTING_ARTIFACT,
+      "legacy segment metadata must not contain a current-format scoped posting artifact"
+    );
+  }
 
   const offsetInput = await readJsonArtifact(root, segment, "docs.offset");
   const offsetTable = validateArtifact(segment, "docs.offset", () =>
@@ -132,6 +157,20 @@ export async function validateSegmentFileSet(
   );
   validatePostingIndex(segment, postingIndex, physicalDocIds);
 
+  let scopedPostingIndex: ScopedPostingIndexFileInput | undefined;
+  if (metadata.version === 2) {
+    const scopedPostingInput = await readJsonArtifact(root, segment, SCOPED_POSTING_ARTIFACT);
+    scopedPostingIndex = validateArtifact(segment, SCOPED_POSTING_ARTIFACT, () =>
+      assertIs(
+        ScopedPostingIndexFileGuard,
+        scopedPostingInput,
+        "corruption",
+        "Invalid immutable segment scoped posting index."
+      )
+    );
+    validateScopedPostingIndex(segment, scopedPostingIndex, physicalDocIds);
+  }
+
   const bloomInput = await readJsonArtifact(root, segment, "bloom.bin");
   const bloom = validateArtifact(segment, "bloom.bin", () =>
     assertIs(
@@ -154,7 +193,25 @@ export async function validateSegmentFileSet(
   );
   validateDeleteBitmap(segment, deleteBitmap, physicalDocIds);
 
-  return { metadata, offsetTable, postingIndex, deleteBitmap };
+  return {
+    metadata,
+    offsetTable,
+    postingIndex,
+    ...(scopedPostingIndex === undefined ? {} : { scopedPostingIndex }),
+    deleteBitmap
+  };
+}
+
+async function artifactExists(root: string, artifact: SegmentArtifactName): Promise<boolean> {
+  try {
+    await stat(join(root, artifact));
+    return true;
+  } catch (error) {
+    if (isMissingPath(error)) {
+      return false;
+    }
+    throw new SabliStorageError(`Failed to inspect immutable segment artifact ${artifact}.`, { cause: error });
+  }
 }
 
 async function requireRegularFile(
@@ -348,6 +405,252 @@ function validatePostingIndex(
       }
     }
   }
+}
+
+function validateScopedPostingIndex(
+  segment: string,
+  postings: ScopedPostingIndexFileInput,
+  physicalDocIds: ReadonlySet<number>
+): void {
+  const scopesByArrayPath = new Map<string, ReadonlySet<string>>();
+  let previousScopeKey: string | undefined;
+  for (const row of postings.scopes) {
+    validateCanonicalArrayPath(segment, row.arrayPath);
+    if (previousScopeKey !== undefined && compareStrings(previousScopeKey, row.arrayPath) >= 0) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "scope-universe keys must be strictly sorted and unique"
+      );
+    }
+    previousScopeKey = row.arrayPath;
+    validateScopedPostingPairs(segment, row.postings, physicalDocIds);
+    scopesByArrayPath.set(row.arrayPath, new Set(row.postings.map(([docId, scopeId]) => scopedPairKey(docId, scopeId))));
+  }
+
+  let previousPathKey: string | undefined;
+  for (const row of postings.pathExists) {
+    validateCanonicalArrayPath(segment, row.arrayPath);
+    validateCanonicalRelativePath(segment, row.relativePath);
+    const key = encodeScopedPathKey(row.arrayPath, row.relativePath);
+    if (previousPathKey !== undefined && compareStrings(previousPathKey, key) >= 0) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "path-exists keys must be strictly sorted and unique"
+      );
+    }
+    previousPathKey = key;
+    validateScopedPostingPairs(
+      segment,
+      row.postings,
+      physicalDocIds,
+      requireScopeUniverse(segment, scopesByArrayPath, row.arrayPath)
+    );
+  }
+
+  let previousTermKey: string | undefined;
+  for (const row of postings.termPostings) {
+    validateCanonicalArrayPath(segment, row.arrayPath);
+    validateCanonicalRelativePath(segment, row.relativePath);
+    if (primitiveValueType(row.value) !== row.valueType) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "term posting valueType does not match its primitive value"
+      );
+    }
+    if (typeof row.value === "number" && !Number.isFinite(row.value)) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "term posting values must be finite JSON numbers"
+      );
+    }
+    const key = encodeScopedTermIdentity(row.arrayPath, row.relativePath, row.valueType, row.value);
+    if (previousTermKey !== undefined && compareStrings(previousTermKey, key) >= 0) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "term posting keys must be strictly sorted and unique"
+      );
+    }
+    previousTermKey = key;
+    validateScopedPostingPairs(
+      segment,
+      row.postings,
+      physicalDocIds,
+      requireScopeUniverse(segment, scopesByArrayPath, row.arrayPath)
+    );
+  }
+
+  let previousNumericKey: string | undefined;
+  for (const row of postings.numericValues) {
+    validateCanonicalArrayPath(segment, row.arrayPath);
+    validateCanonicalRelativePath(segment, row.relativePath);
+    const key = encodeScopedPathKey(row.arrayPath, row.relativePath);
+    if (previousNumericKey !== undefined && compareStrings(previousNumericKey, key) >= 0) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "numeric posting keys must be strictly sorted and unique"
+      );
+    }
+    previousNumericKey = key;
+    const scopeUniverse = requireScopeUniverse(segment, scopesByArrayPath, row.arrayPath);
+    let previousValue: { readonly docId: number; readonly scopeId: number; readonly value: number } | undefined;
+    for (const value of row.values) {
+      if (
+        !isSafePositiveInteger(value.docId) ||
+        !isSafePositiveInteger(value.scopeId) ||
+        !physicalDocIds.has(value.docId) ||
+        !Number.isFinite(value.value)
+      ) {
+        throw segmentCorruption(
+          segment,
+          SCOPED_POSTING_ARTIFACT,
+          "numeric posting contains invalid identifiers or a non-finite value"
+        );
+      }
+      if (!scopeUniverse.has(scopedPairKey(value.docId, value.scopeId))) {
+        throw segmentCorruption(
+          segment,
+          SCOPED_POSTING_ARTIFACT,
+          "numeric posting references an unknown concrete element scope"
+        );
+      }
+      if (previousValue !== undefined && compareScopedNumericValues(previousValue, value) >= 0) {
+        throw segmentCorruption(
+          segment,
+          SCOPED_POSTING_ARTIFACT,
+          "numeric posting values must be strictly sorted and unique"
+        );
+      }
+      previousValue = value;
+    }
+  }
+}
+
+function validateScopedPostingPairs(
+  segment: string,
+  pairs: readonly ScopedPostingPairInput[],
+  physicalDocIds: ReadonlySet<number>,
+  scopeUniverse?: ReadonlySet<string>
+): void {
+  let previous: ScopedPostingPairInput | undefined;
+  for (const pair of pairs) {
+    const [docId, scopeId] = pair;
+    if (!isSafePositiveInteger(docId) || !isSafePositiveInteger(scopeId) || !physicalDocIds.has(docId)) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "scoped posting contains an identifier outside the physical segment domain"
+      );
+    }
+    if (scopeUniverse !== undefined && !scopeUniverse.has(scopedPairKey(docId, scopeId))) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "scoped posting references an unknown concrete element scope"
+      );
+    }
+    if (previous !== undefined && compareScopedPairs(previous, pair) >= 0) {
+      throw segmentCorruption(
+        segment,
+        SCOPED_POSTING_ARTIFACT,
+        "scoped posting pairs must be strictly sorted and unique"
+      );
+    }
+    previous = pair;
+  }
+}
+
+function requireScopeUniverse(
+  segment: string,
+  scopesByArrayPath: ReadonlyMap<string, ReadonlySet<string>>,
+  arrayPath: string
+): ReadonlySet<string> {
+  const universe = scopesByArrayPath.get(arrayPath);
+  if (universe === undefined) {
+    throw segmentCorruption(
+      segment,
+      SCOPED_POSTING_ARTIFACT,
+      `scoped posting references an unknown array path ${arrayPath}`
+    );
+  }
+  return universe;
+}
+
+function validateCanonicalArrayPath(segment: string, path: string): void {
+  let normalized: string;
+  try {
+    normalized = normalizeJsonPath(path);
+  } catch (error) {
+    throw segmentCorruption(segment, SCOPED_POSTING_ARTIFACT, "array path syntax is invalid", error);
+  }
+  if (normalized !== path || !path.endsWith("[]")) {
+    throw segmentCorruption(
+      segment,
+      SCOPED_POSTING_ARTIFACT,
+      "array paths must use canonical syntax and end in an array token"
+    );
+  }
+}
+
+function validateCanonicalRelativePath(segment: string, path: string): void {
+  if (path === "$") {
+    return;
+  }
+  let normalized: string;
+  try {
+    normalized = normalizeJsonPath(path);
+  } catch (error) {
+    throw segmentCorruption(segment, SCOPED_POSTING_ARTIFACT, "relative path syntax is invalid", error);
+  }
+  if (normalized !== path) {
+    throw segmentCorruption(segment, SCOPED_POSTING_ARTIFACT, "relative paths must use canonical syntax");
+  }
+}
+
+function primitiveValueType(value: null | boolean | number | string): "null" | "boolean" | "number" | "string" {
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "boolean") {
+    return "boolean";
+  }
+  if (typeof value === "number") {
+    return "number";
+  }
+  return "string";
+}
+
+function compareStrings(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
+function compareScopedPairs(left: ScopedPostingPairInput, right: ScopedPostingPairInput): number {
+  return left[0] === right[0] ? left[1] - right[1] : left[0] - right[0];
+}
+
+function compareScopedNumericValues(
+  left: { readonly docId: number; readonly scopeId: number; readonly value: number },
+  right: { readonly docId: number; readonly scopeId: number; readonly value: number }
+): number {
+  if (left.docId !== right.docId) {
+    return left.docId - right.docId;
+  }
+  if (left.scopeId !== right.scopeId) {
+    return left.scopeId - right.scopeId;
+  }
+  return left.value - right.value;
+}
+
+function scopedPairKey(docId: number, scopeId: number): string {
+  return `${String(docId)}:${String(scopeId)}`;
 }
 
 function validatePostingDocIds(

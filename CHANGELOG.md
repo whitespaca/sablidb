@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0 - Scope-Aware Array `elemMatch` Semantics
+
+- Added canonical `{ path: "array[]", elemMatch: expression }` queries with relative child paths and exact same-array-element AND/OR semantics.
+- Added deterministic numeric element scopes, ancestor-aware scoped extraction, and sorted unique `(Document ID, Scope ID)` posting operations.
+- Added scoped equality, existence, and numeric range candidate indexes in memory and in immutable segments without changing ordinary document posting semantics.
+- Added segment metadata version 2 with a separate TypeSea-validated `scoped-postings.idx` file and controlled corruption handling.
+- Kept version-1 segments readable through conservative `elemMatch` fallback candidates and exact raw-document verification; compaction upgrades visible legacy data.
+- Integrated scoped posting cache keys, delete/update visibility filtering, compaction rebuilds, diagnostics, deterministic randomized equivalence coverage, and scoped search benchmarks.
+- Added `examples/elem-match.ts` and documented cross-element non-matches, nested relative paths, legacy compatibility, performance behavior, and current nested-scope limitations.
+- Preserved atomic update WAL records, immutable segment overwrite protection, complete current-format file validation, TypeSea `^0.4.0`, ESModule-only packaging, Node.js 22+, and exact final verification.
+
 ## 1.3.1 - Segment Integrity And Sparse Candidate Hardening
 
 - Made current-format `delete.bitmap` loading fail with controlled SABLI domain errors when the file is missing, unreadable, malformed, unsupported, or contains invalid document identifiers instead of silently treating corruption as an empty bitmap.
@@ -36,7 +47,7 @@
 - Added `db.stats()` diagnostics for read-only database state and storage metadata.
 - Added deterministic TypeScript benchmark scripts for insert, search, reopen, and compaction measurements.
 
-Current limitations: compaction is manual, posting files are correctness-first JSON structures, range indexing is basic, automatic background compaction is not implemented, and advanced scope-aware `elemMatch` indexing remains future work.
+Current limitations: compaction is manual, posting files are correctness-first JSON structures, range indexing is basic, automatic background compaction is not implemented, and nested `elemMatch` remains future work.
 
 ## 1.1.0 - Durable Mutation Support
 

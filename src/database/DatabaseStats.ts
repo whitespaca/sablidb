@@ -23,6 +23,10 @@ export interface SabliDatabaseStats {
   readonly validatedImmutableSegmentCount: number;
   /** Current immutable segment format version, or null when no immutable segment is loaded. */
   readonly immutableSegmentFormatVersion: number | null;
+  /** Sorted immutable segment format versions currently in use. */
+  readonly immutableSegmentFormatVersions: readonly number[];
+  /** Number of legacy segments that require raw-document elemMatch candidate fallback. */
+  readonly legacyElemMatchFallbackSegmentCount: number;
   /** Number of delete bitmap entries loaded from validated immutable segments. */
   readonly loadedDeleteBitmapEntryCount: number;
   /** Number of exact physical document identifiers loaded from immutable segment offset tables. */
@@ -45,6 +49,18 @@ export interface SabliDatabaseStats {
   readonly immutableTermPostingKeyCount: number;
   /** Total immutable-segment equality or contains posting rows. */
   readonly immutableTermPostingCount: number;
+  /** Number of immutable scoped array-universe posting keys. */
+  readonly immutableScopedArrayPostingKeyCount: number;
+  /** Total immutable concrete array-element scope rows. */
+  readonly immutableScopedArrayPostingCount: number;
+  /** Number of immutable scoped path-exists posting keys. */
+  readonly immutableScopedPathPostingKeyCount: number;
+  /** Total immutable scoped path-exists posting rows. */
+  readonly immutableScopedPathPostingCount: number;
+  /** Number of immutable scoped equality or contains posting keys. */
+  readonly immutableScopedTermPostingKeyCount: number;
+  /** Total immutable scoped equality or contains posting rows. */
+  readonly immutableScopedTermPostingCount: number;
   /** True when manual compaction can be called on this database handle. */
   readonly compactionAvailable: boolean;
   /** Current number of cached immutable-segment posting lists. */
@@ -55,4 +71,10 @@ export interface SabliDatabaseStats {
   readonly postingCacheHits: number;
   /** Number of immutable-segment posting cache misses. */
   readonly postingCacheMisses: number;
+  /** Number of scoped postings currently using the shared immutable cache budget. */
+  readonly scopedPostingCacheSize: number;
+  /** Number of successful scoped posting cache lookups. */
+  readonly scopedPostingCacheHits: number;
+  /** Number of missed scoped posting cache lookups. */
+  readonly scopedPostingCacheMisses: number;
 }

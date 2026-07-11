@@ -9,6 +9,11 @@ import { DocumentBlockWriter } from "../storage/DocumentBlockStore.js";
 import type { ManifestSegmentEntry } from "../storage/ManifestStore.js";
 import type { SegmentId } from "../types/json.js";
 import { encodeTermKey, type MemSegmentSnapshot } from "./MemSegment.js";
+import {
+  buildScopedPostingIndex,
+  encodeScopedPathBloomTerm,
+  encodeScopedTermBloomTerm
+} from "./ScopedPostingIndex.js";
 import type { SegmentMetadata } from "./SegmentMetadata.js";
 
 interface PostingIndexFile {
@@ -103,6 +108,14 @@ export class SegmentWriter {
         }
       }
 
+      const scopedPostings = buildScopedPostingIndex(snapshot.documents);
+      for (const row of scopedPostings.pathExists) {
+        bloom.add(encodeScopedPathBloomTerm(row.arrayPath, row.relativePath));
+      }
+      for (const row of scopedPostings.termPostings) {
+        bloom.add(encodeScopedTermBloomTerm(row.arrayPath, row.relativePath, row.valueType, row.value));
+      }
+
       const offsetTable = await new DocumentBlockWriter(join(tempPath, "docs.bin")).writeAll(snapshot.documents);
       await writeFile(join(tempPath, "docs.offset"), JSON.stringify(offsetTable));
       await writeFile(join(tempPath, "path.dict"), JSON.stringify({ format: "sabli-path-dict", version: 1, paths: [...paths].sort() }));
@@ -115,11 +128,12 @@ export class SegmentWriter {
         numericValues: [...numericValues.entries()].map(([path, rows]) => [path, rows] as const)
       };
       await writeFile(join(tempPath, "postings.idx"), JSON.stringify(postings));
+      await writeFile(join(tempPath, "scoped-postings.idx"), JSON.stringify(scopedPostings));
       await writeFile(join(tempPath, "bloom.bin"), JSON.stringify(bloom.serialize()));
       await writeFile(join(tempPath, "delete.bitmap"), JSON.stringify({ format: "sabli-delete-bitmap", version: 1, deleted: [] }));
       const metadataPayload = {
         format: "sabli-segment" as const,
-        version: 1 as const,
+        version: 2 as const,
         segmentId,
         docCount: snapshot.documents.length,
         minDocId,
